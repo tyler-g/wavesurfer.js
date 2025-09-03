@@ -23,6 +23,10 @@ export type RecordPluginOptions = {
   continuousWaveformDuration?: number
   /** The timeslice to use for the media recorder */
   mediaRecorderTimeslice?: number
+  /** The AudioContext to use. If none passed , a new one is generated */
+  audioContext?: AudioContext
+  /** The Worker reference to use for listening to raw audio data. This can be used in combination with MediaRecorder (which does not support lossless)*/
+  workerContext?: Worker
 }
 
 export type RecordPluginDeviceOptions = MediaTrackConstraints
@@ -45,6 +49,7 @@ export type RecordPluginEvents = BasePluginEvents & {
 type MicStream = {
   onDestroy: () => void
   onEnd: () => void
+  source: MediaStreamAudioSourceNode
 }
 
 const DEFAULT_BITS_PER_SECOND = 128000
@@ -56,6 +61,7 @@ const findSupportedMimeType = () => MIME_TYPES.find((mimeType) => MediaRecorder.
 
 class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private stream: MediaStream | null = null
+  private source: MediaStreamAudioSourceNode | null = null
   private mediaRecorder: MediaRecorder | null = null
   private dataWindow: Float32Array | null = null
   private isWaveformPaused = false
@@ -75,6 +81,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       continuousWaveform: options.continuousWaveform ?? false,
       renderRecordedAudio: options.renderRecordedAudio ?? true,
       mediaRecorderTimeslice: options.mediaRecorderTimeslice ?? undefined,
+      audioContext: options.audioContext ?? new AudioContext(),
+      workerContext: options.workerContext ?? undefined,
     })
 
     this.timer = new Timer()
@@ -91,6 +99,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   /** Create an instance of the Record plugin */
   public static create(options?: RecordPluginOptions) {
     return new RecordPlugin(options || {})
+  }
+
+  public getSource(): MediaStreamAudioSourceNode | null {
+    return this.source
   }
 
   public renderMicStream(stream: MediaStream): MicStream {
@@ -204,6 +216,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         clearInterval(intervalId)
         this.stopMic()
       },
+      source
     }
   }
 
@@ -218,10 +231,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       throw new Error('Error accessing the microphone: ' + (err as Error).message)
     }
 
-    const { onDestroy, onEnd } = this.renderMicStream(stream)
+    const { onDestroy, onEnd, source } = this.renderMicStream(stream)
     this.subscriptions.push(this.once('destroy', onDestroy))
     this.subscriptions.push(this.once('record-end', onEnd))
     this.stream = stream
+    this.source = source
 
     return stream
   }
@@ -231,7 +245,84 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     if (!this.stream) return
     this.stream.getTracks().forEach((track) => track.stop())
     this.stream = null
+    this.source = null
     this.mediaRecorder = null
+  }
+
+  private async padPCMToDuration(pcmData: Float32Array[], targetDuration: number): Promise<Blob> {
+    // Get the sample rate from the audio context
+    const sampleRate = this.options.audioContext?.sampleRate || 44100
+    const numChannels = pcmData.length
+
+    // Calculate the target length in samples
+    const targetLength = Math.floor(targetDuration * sampleRate)
+
+    // Create padded PCM arrays
+    const paddedPCM = pcmData.map((channel) => {
+      const padded = new Float32Array(targetLength)
+      padded.set(channel)
+      return padded
+    })
+
+    // Convert to WAV
+    const format = 1 // PCM
+    const bitDepth = 16
+    const bytesPerSample = bitDepth / 8
+    const blockAlign = numChannels * bytesPerSample
+    const byteRate = sampleRate * blockAlign
+    const dataSize = targetLength * blockAlign
+    const headerSize = 44
+    const totalSize = headerSize + dataSize
+
+    const wavArrayBuffer = new ArrayBuffer(totalSize)
+    const view = new DataView(wavArrayBuffer)
+
+    // RIFF identifier
+    this.writeString(view, 0, 'RIFF')
+    // RIFF chunk length
+    view.setUint32(4, totalSize - 8, true)
+    // RIFF type
+    this.writeString(view, 8, 'WAVE')
+    // format chunk identifier
+    this.writeString(view, 12, 'fmt ')
+    // format chunk length
+    view.setUint32(16, 16, true)
+    // sample format (raw)
+    view.setUint16(20, format, true)
+    // channel count
+    view.setUint16(22, numChannels, true)
+    // sample rate
+    view.setUint32(24, sampleRate, true)
+    // byte rate (sample rate * block align)
+    view.setUint32(28, byteRate, true)
+    // block align (channel count * bytes per sample)
+    view.setUint16(32, blockAlign, true)
+    // bits per sample
+    view.setUint16(34, bitDepth, true)
+    // data chunk identifier
+    this.writeString(view, 36, 'data')
+    // data chunk length
+    view.setUint32(40, dataSize, true)
+
+    // Write the PCM samples
+    const offset = 44
+    let pos = 0
+    for (let i = 0; i < targetLength; i++) {
+      for (let channel = 0; channel < numChannels; channel++) {
+        const sample = Math.max(-1, Math.min(1, paddedPCM[channel][i]))
+        const value = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+        view.setInt16(offset + pos, value, true)
+        pos += 2
+      }
+    }
+
+    return new Blob([wavArrayBuffer], { type: 'audio/wav' })
+  }
+
+  private writeString(view: DataView, offset: number, string: string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i))
+    }
   }
 
   /** Start recording audio from the microphone */
@@ -247,7 +338,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.mediaRecorder = mediaRecorder
     this.stopRecording()
 
-    const recordedChunks: BlobPart[] = []
+    const recordedChunks: BlobPart[] = [] // this is the mediaRecorder data (COMPRESSED)
+    const recordedChunksPCM: Float32Array[] = [] // this is the raw PCM data (UNCOMPRESSED) Only available with workerContext and pcm passthrough
+
 
     mediaRecorder.ondataavailable = (event) => {
       if (event.data.size > 0) {
@@ -256,12 +349,40 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.emit('record-data-available', event.data)
     }
 
+    if (this.options.workerContext) {
+      this.options.workerContext.onmessage = async (e) => {
+        if (!e.data) return
+        // received a raw audio chunk from the stream
+        if (e.data.cmd === 'passthrough') {
+          // console.log('record plugin received pcm', e.data.pcm)
+          recordedChunksPCM.push(e.data.pcm)
+          return
+        }
+        if (e.data.cmd === 'passthrough-uint8') {
+          //console.log('record plugin received pcm as uint8', e.data.pcm)
+          return
+        }
+        if (e.data.cmd === 'pcm-data') {
+          console.log('record plugin | received pcm data', e.data.pcm)
+          // Pad the PCM data to 60 seconds and convert to WAV
+          const paddedWav = await this.padPCMToDuration(e.data.pcm, 60)
+          this.wavesurfer?.load(URL.createObjectURL(paddedWav), undefined, 60)
+          return
+        }
+      }
+    }
     const emitWithBlob = (ev: 'record-pause' | 'record-end') => {
       const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType })
       this.emit(ev, blob)
       if (this.options.renderRecordedAudio) {
         this.applyOriginalOptionsIfNeeded()
-        this.wavesurfer?.load(URL.createObjectURL(blob))
+        //console.log('tester recordedChunks', recordedChunks)
+        this.options.workerContext?.postMessage({
+          cmd: 'export-wav2',
+          buf: recordedChunksPCM,
+        })
+        //this.wavesurfer?.load(URL.createObjectURL(blob), undefined, 60)
+        //this.wavesurfer?.load(URL.createObjectURL(blob))
       }
     }
 

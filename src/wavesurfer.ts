@@ -80,6 +80,8 @@ export type WaveSurferOptions = {
   cspNonce?: string
   /** Override the Blob MIME type */
   blobMimeType?: string
+  /** (if WebAudio backend) AudioContext to use. If none passed a new one is created */
+  audioContext?: AudioContext
 }
 
 const defaultOptions = {
@@ -428,6 +430,29 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     return this.plugins
   }
 
+  private padAudioBufferToDuration(buffer: AudioBuffer, targetDuration: number): AudioBuffer {
+    const sampleRate = buffer.sampleRate
+    const targetLength = Math.floor(targetDuration * sampleRate)
+    const numChannels = buffer.numberOfChannels
+
+    // Create a new buffer with the target duration
+    const paddedBuffer = new AudioBuffer({
+      length: targetLength,
+      numberOfChannels: numChannels,
+      sampleRate: sampleRate,
+    })
+
+    // Copy the original data to the new buffer
+    for (let channel = 0; channel < numChannels; channel++) {
+      const originalData = buffer.getChannelData(channel)
+      const paddedData = paddedBuffer.getChannelData(channel)
+      paddedData.set(originalData)
+      // The rest of the buffer will be filled with zeros by default
+    }
+
+    return paddedBuffer
+  }
+
   private async loadAudio(url: string, blob?: Blob, channelData?: WaveSurferOptions['peaks'], duration?: number) {
     this.emit('load', url)
 
@@ -474,15 +499,25 @@ class WaveSurfer extends Player<WaveSurferEvents> {
       }
     }
 
+    // test hardcode to 60 seconds
+    console.log('loadAudio | audioDuration', audioDuration)
+
     // Decode the audio data or use user-provided peaks
     if (channelData) {
       this.decodedData = Decoder.createBuffer(channelData, audioDuration || 0)
     } else if (blob) {
+      console.log('loadAudio |blob', blob)
       const arrayBuffer = await blob.arrayBuffer()
+      // sample rate is 8000 by default or whatever mediaRecorder is set to.  If this is a wav it should be high quality?
+      // this is only being used to pass to the renderer, so maybe sample rate doesn't matter?
       this.decodedData = await Decoder.decode(arrayBuffer, this.options.sampleRate)
     }
 
     if (this.decodedData) {
+      // Pad the buffer to 60 seconds if it's shorter
+      if (this.decodedData.duration < 60) {
+        this.decodedData = this.padAudioBufferToDuration(this.decodedData, 60)
+      }
       this.emit('decode', this.getDuration())
       this.renderer.render(this.decodedData)
     }
