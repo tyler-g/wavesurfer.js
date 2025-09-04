@@ -94,7 +94,7 @@ const defaultOptions = {
   dragToSeek: false,
   autoScroll: true,
   autoCenter: true,
-  sampleRate: 8000,
+  sampleRate: 48000,
 }
 
 export type WaveSurferEvents = {
@@ -169,7 +169,9 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   constructor(options: WaveSurferOptions) {
     const media =
       options.media ||
-      (options.backend === 'WebAudio' ? (new WebAudioPlayer() as unknown as HTMLAudioElement) : undefined)
+      (options.backend === 'WebAudio'
+        ? (new WebAudioPlayer(options.audioContext) as unknown as HTMLAudioElement)
+        : undefined)
 
     super({
       media,
@@ -560,7 +562,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   }
 
   /** Get decoded peaks */
-  public exportPeaks({ channels = 2, maxLength = 8000, precision = 10_000 } = {}): Array<number[]> {
+  public exportPeaks({ channels = 2, maxLength = 48000, precision = 10_000 } = {}): Array<number[]> {
     if (!this.decodedData) {
       throw new Error('The audio has not been decoded yet')
     }
@@ -650,6 +652,11 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   /** Empty the waveform */
   public empty() {
     this.load('', [[0]], 0.001)
+  }
+
+  /** force rerender of the waveform */
+  public reRender() {
+    this.renderer.reRender()
   }
 
   /** Set HTML media element */

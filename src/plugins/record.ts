@@ -106,7 +106,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   }
 
   public renderMicStream(stream: MediaStream): MicStream {
-    const audioContext = new AudioContext()
+    const audioContext = this.options.audioContext || new AudioContext()
     const source = audioContext.createMediaStreamSource(stream)
     const analyser = audioContext.createAnalyser()
     source.connect(analyser)
@@ -251,7 +251,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
   private async padPCMToDuration(pcmData: Float32Array[], targetDuration: number): Promise<Blob> {
     // Get the sample rate from the audio context
-    const sampleRate = this.options.audioContext?.sampleRate || 44100
+    const sampleRate = this.options.audioContext?.sampleRate || 48000
     const numChannels = pcmData.length
 
     // Calculate the target length in samples

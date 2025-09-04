@@ -229,6 +229,12 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     }
     return channels
   }
+
+  /** Remove an attribute (compatibility method for HTMLMediaElement interface) */
+  public removeAttribute(name: string): void {
+    // WebAudio doesn't use attributes, so this is a no-op
+    // This method exists for compatibility with HTMLMediaElement interface
+  }
 }
 
 export default WebAudioPlayer
