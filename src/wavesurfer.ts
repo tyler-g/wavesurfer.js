@@ -94,7 +94,7 @@ const defaultOptions = {
   dragToSeek: false,
   autoScroll: true,
   autoCenter: true,
-  sampleRate: 48000,
+  sampleRate: 44100,
 }
 
 export type WaveSurferEvents = {
@@ -512,13 +512,15 @@ class WaveSurfer extends Player<WaveSurferEvents> {
       const arrayBuffer = await blob.arrayBuffer()
       // sample rate is 8000 by default or whatever mediaRecorder is set to.  If this is a wav it should be high quality?
       // this is only being used to pass to the renderer, so maybe sample rate doesn't matter?
+      console.log('loadAudio | decoding arrayBuffer at sampleRate', this.options.sampleRate)
       this.decodedData = await Decoder.decode(arrayBuffer, this.options.sampleRate)
     }
 
     if (this.decodedData) {
       // Pad the buffer to 60 seconds if it's shorter
       if (this.decodedData.duration < 60) {
-        this.decodedData = this.padAudioBufferToDuration(this.decodedData, 60)
+       // console.log('loadAudio | padding audio buffer to 60 seconds');
+        //this.decodedData = this.padAudioBufferToDuration(this.decodedData, 60)
       }
       this.emit('decode', this.getDuration())
       this.renderer.render(this.decodedData)
@@ -562,7 +564,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   }
 
   /** Get decoded peaks */
-  public exportPeaks({ channels = 2, maxLength = 48000, precision = 10_000 } = {}): Array<number[]> {
+  public exportPeaks({ channels = 2, maxLength = 44100, precision = 10_000 } = {}): Array<number[]> {
     if (!this.decodedData) {
       throw new Error('The audio has not been decoded yet')
     }
