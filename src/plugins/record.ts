@@ -70,6 +70,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private lastStartTime = 0
   private lastDuration = 0
   private duration = 0
+  private micStream: MicStream | null = null
+  private unsubscribeDestroy?: () => void
+  private unsubscribeRecordEnd?: () => void
 
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
@@ -205,15 +208,16 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     const intervalId = setInterval(drawWaveform, 1000 / FPS)
 
+    const cleanup = () => {
+      clearInterval(intervalId)
+      source?.disconnect()
+      audioContext?.close()
+    }
+
     return {
-      onDestroy: () => {
-        clearInterval(intervalId)
-        source?.disconnect()
-        audioContext?.close()
-      },
+      onDestroy: cleanup,
       onEnd: () => {
         this.isWaveformPaused = true
-        clearInterval(intervalId)
         this.stopMic()
       },
       source
@@ -231,17 +235,24 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       throw new Error('Error accessing the microphone: ' + (err as Error).message)
     }
 
-    const { onDestroy, onEnd, source } = this.renderMicStream(stream)
-    this.subscriptions.push(this.once('destroy', onDestroy))
-    this.subscriptions.push(this.once('record-end', onEnd))
+    const micStream = this.renderMicStream(stream)
+    this.micStream = micStream
+    this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
+    this.unsubscribeRecordEnd = this.once('record-end', micStream.onEnd)
     this.stream = stream
-    this.source = source
+    this.source = micStream.source
 
     return stream
   }
 
   /** Stop monitoring incoming audio */
   public stopMic() {
+    this.micStream?.onDestroy()
+    this.unsubscribeDestroy?.()
+    this.unsubscribeRecordEnd?.()
+    this.micStream = null
+    this.unsubscribeDestroy = undefined
+    this.unsubscribeRecordEnd = undefined
     if (!this.stream) return
     this.stream.getTracks().forEach((track) => track.stop())
     this.stream = null

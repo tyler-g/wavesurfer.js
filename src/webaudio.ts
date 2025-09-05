@@ -230,10 +230,30 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     return channels
   }
 
-  /** Remove an attribute (compatibility method for HTMLMediaElement interface) */
-  public removeAttribute(name: string): void {
-    // WebAudio doesn't use attributes, so this is a no-op
-    // This method exists for compatibility with HTMLMediaElement interface
+  /**
+   * Imitate `HTMLElement.removeAttribute` for compatibility with `Player`.
+   */
+  public removeAttribute(attrName: string) {
+    switch (attrName) {
+      case 'src':
+        this.src = ''
+        break
+      case 'playbackRate':
+        this.playbackRate = 0
+        break
+      case 'currentTime':
+        this.currentTime = 0
+        break
+      case 'duration':
+        this.duration = 0
+        break
+      case 'volume':
+        this.volume = 0
+        break
+      case 'muted':
+        this.muted = false
+        break
+    }
   }
 }
 

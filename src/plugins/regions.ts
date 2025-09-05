@@ -477,6 +477,13 @@ class RegionsPlugin extends BasePlugin<RegionsPluginEvents, RegionsPluginOptions
     }
     this.wavesurfer.getWrapper().appendChild(this.regionsContainer)
 
+    // Update region durations when a new audio file is loaded
+    this.subscriptions.push(
+      this.wavesurfer.on('ready', (duration) => {
+        this.regions.forEach((region) => region._setTotalDuration(duration))
+      }),
+    )
+
     let activeRegions: Region[] = []
     this.subscriptions.push(
       this.wavesurfer.on('timeupdate', (currentTime) => {
@@ -589,11 +596,14 @@ class RegionsPlugin extends BasePlugin<RegionsPluginEvents, RegionsPluginOptions
     }
 
     setTimeout(() => {
-      if (!this.wavesurfer) return
+      if (!this.wavesurfer || !region.element) return
       renderIfVisible()
 
-      const unsubscribe = this.wavesurfer.on('scroll', renderIfVisible)
-      this.subscriptions.push(region.once('remove', unsubscribe), unsubscribe)
+      const unsubscribeScroll = this.wavesurfer.on('scroll', renderIfVisible)
+      const unsubscribeZoom = this.wavesurfer.on('zoom', renderIfVisible)
+
+      this.subscriptions.push(region.once('remove', unsubscribeScroll), unsubscribeScroll)
+      this.subscriptions.push(region.once('remove', unsubscribeZoom), unsubscribeZoom)
     }, 0)
   }
 
