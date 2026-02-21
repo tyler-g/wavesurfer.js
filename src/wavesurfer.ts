@@ -468,7 +468,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
   private async loadAudio(url: string, blob?: Blob, channelData?: WaveSurferOptions['peaks'], duration?: number) {
     this.emit('load', url)
-
+    console.log('loadAudio | url', url, blob, channelData, duration);
     if (!this.options.media && this.isPlaying()) this.pause()
 
     this.decodedData = null
@@ -476,6 +476,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Fetch the entire audio as a blob if pre-decoded data is not provided
     if (!blob && !channelData) {
+      console.log('loadAudio | !blob && !channelData');
       const fetchParams = this.options.fetchParams || {}
       if (window.AbortController && !fetchParams.signal) {
         this.abortController = new AbortController()
@@ -491,6 +492,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Set the mediaelement source
     this.setSrc(url, blob)
+    console.log('loadAudio | setSrc', url, blob);
 
     // Wait for the audio duration
     const audioDuration = await new Promise<number>((resolve) => {
@@ -506,6 +508,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Set the duration if the player is a WebAudioPlayer without a URL
     if (!url && !blob) {
+      console.log('loadAudio | !url && !blob');
       const media = this.getMediaElement()
       if (media instanceof WebAudioPlayer) {
         media.duration = audioDuration
@@ -530,7 +533,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     if (this.decodedData) {
       // Pad the buffer to 60 seconds if it's shorter
       if (this.decodedData.duration < 60) {
-       // console.log('loadAudio | padding audio buffer to 60 seconds');
+        // console.log('loadAudio | padding audio buffer to 60 seconds');
         //this.decodedData = this.padAudioBufferToDuration(this.decodedData, 60)
       }
       this.emit('decode', this.getDuration())

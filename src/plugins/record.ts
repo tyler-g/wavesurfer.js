@@ -52,6 +52,18 @@ type MicStream = {
   source: MediaStreamAudioSourceNode
 }
 
+type AudioEdit = {
+  id: string
+  type: string
+  startSample: number
+  endSample: number
+}
+
+type SampleRange = {
+  startSample: number
+  endSample: number
+}
+
 const DEFAULT_BITS_PER_SECOND = 128000
 const DEFAULT_SCROLLING_WAVEFORM_WINDOW = 5
 const FPS = 100
@@ -73,6 +85,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private micStream: MicStream | null = null
   private unsubscribeDestroy?: () => void
   private unsubscribeRecordEnd?: () => void
+
+  // Non-destructive editing state
+  private originalPcm: Float32Array[] | null = null
+  private pcmSampleRate: number = 44100
+  private edits: AudioEdit[] = []
 
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
@@ -110,8 +127,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
   public renderMicStream(stream: MediaStream): MicStream {
     const audioContext = this.options.audioContext || new AudioContext()
-    const source = audioContext.createMediaStreamSource(stream)
-    const analyser = audioContext.createAnalyser()
+    let source = audioContext.createMediaStreamSource(stream)
+    let analyser = audioContext.createAnalyser()
     source.connect(analyser)
 
     if (this.options.continuousWaveform) {
@@ -210,8 +227,14 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     const cleanup = () => {
       clearInterval(intervalId)
+
       source?.disconnect()
-      audioContext?.close()
+      analyser?.disconnect()
+
+      // if the audio context was passed, don't close it
+      if (!this.options.audioContext) {
+        audioContext?.close()
+      }
     }
 
     return {
@@ -260,9 +283,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.mediaRecorder = null
   }
 
-  private async padPCMToDuration(pcmData: Float32Array[], targetDuration: number): Promise<Blob> {
+  private padPCMToDuration(pcmData: Float32Array[], targetDuration: number): Blob {
     // Get the sample rate from the audio context
-    const sampleRate = this.options.audioContext?.sampleRate || 48000
+    const sampleRate = this.options.audioContext?.sampleRate || 44100
     const numChannels = pcmData.length
 
     // Calculate the target length in samples
@@ -330,11 +353,110 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return new Blob([wavArrayBuffer], { type: 'audio/wav' })
   }
 
+  private convertPCMToWAV(pcmData: Float32Array[]): Blob {
+    // Get the sample rate from the audio context
+    const sampleRate = this.options.audioContext?.sampleRate || 44100
+    const numChannels = pcmData.length
+
+    // Use the actual length of the first channel (assuming all channels have same length)
+    const actualLength = pcmData[0]?.length || 0
+
+    // Convert to WAV
+    const format = 1 // PCM
+    const bitDepth = 16
+    const bytesPerSample = bitDepth / 8
+    const blockAlign = numChannels * bytesPerSample
+    const byteRate = sampleRate * blockAlign
+    const dataSize = actualLength * blockAlign
+    const headerSize = 44
+    const totalSize = headerSize + dataSize
+
+    const wavArrayBuffer = new ArrayBuffer(totalSize)
+    const view = new DataView(wavArrayBuffer)
+
+    // RIFF identifier
+    this.writeString(view, 0, 'RIFF')
+    // RIFF chunk length
+    view.setUint32(4, totalSize - 8, true)
+    // RIFF type
+    this.writeString(view, 8, 'WAVE')
+    // format chunk identifier
+    this.writeString(view, 12, 'fmt ')
+    // format chunk length
+    view.setUint32(16, 16, true)
+    // sample format (raw)
+    view.setUint16(20, format, true)
+    // channel count
+    view.setUint16(22, numChannels, true)
+    // sample rate
+    view.setUint32(24, sampleRate, true)
+    // byte rate (sample rate * block align)
+    view.setUint32(28, byteRate, true)
+    // block align (channel count * bytes per sample)
+    view.setUint16(32, blockAlign, true)
+    // bits per sample
+    view.setUint16(34, bitDepth, true)
+    // data chunk identifier
+    this.writeString(view, 36, 'data')
+    // data chunk length
+    view.setUint32(40, dataSize, true)
+
+    // Write the PCM samples
+    const offset = 44
+    let pos = 0
+    for (let i = 0; i < actualLength; i++) {
+      for (let channel = 0; channel < numChannels; channel++) {
+        const sample = Math.max(-1, Math.min(1, pcmData[channel][i]))
+        const value = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+        view.setInt16(offset + pos, value, true)
+        pos += 2
+      }
+    }
+
+    return new Blob([wavArrayBuffer], { type: 'audio/wav' })
+  }
+
   private writeString(view: DataView, offset: number, string: string) {
     for (let i = 0; i < string.length; i++) {
       view.setUint8(offset + i, string.charCodeAt(i))
     }
   }
+
+  private getDownloadLink(blob: Blob, filename: string, omitLinkLabel = false) {
+    const name = filename || 'output.wav';
+    const url = (window.URL || window.webkitURL).createObjectURL(blob);
+    const link = window.document.createElement('a');
+    link.href = url;
+    link.download = name;
+    if (!omitLinkLabel) {
+      link.textContent = name;
+    }
+    return link;
+  };
+
+  private forceDownload(blob: Blob, filename: string) {
+    const link = this.getDownloadLink(blob, filename, true);
+    //NOTE: FireFox requires a MouseEvent (in Chrome a simple Event would do the trick)
+    const click = document.createEvent('MouseEvent');
+    click.initMouseEvent(
+      'click',
+      true,
+      true,
+      window,
+      0,
+      0,
+      0,
+      0,
+      0,
+      false,
+      false,
+      false,
+      false,
+      0,
+      null
+    );
+    link.dispatchEvent(click);
+  };
 
   /** Start recording audio from the microphone */
   public async startRecording(options?: RecordPluginDeviceOptions) {
@@ -354,6 +476,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
 
     mediaRecorder.ondataavailable = (event) => {
+      //console.log('mediaRecorder.ondataavailable', event.data);
       if (event.data.size > 0) {
         recordedChunks.push(event.data)
       }
@@ -375,21 +498,27 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         }
         if (e.data.cmd === 'pcm-data') {
           console.log('record plugin | received pcm data', e.data.pcm)
-          // Pad the PCM data to 60 seconds and convert to WAV
-          const paddedWav = await this.padPCMToDuration(e.data.pcm, 60)
-          this.wavesurfer?.load(URL.createObjectURL(paddedWav), undefined, 60)
+          // Store the original PCM internally for non-destructive editing
+          this.originalPcm = e.data.pcm
+          this.pcmSampleRate = this.options.audioContext?.sampleRate || 44100
+          this.edits = []
+          this.emit('record-pcm-data' as any, e.data.pcm)
+
+          const paddedWavBlob = this.padPCMToDuration(e.data.pcm, 60)
+          this.wavesurfer?.load(URL.createObjectURL(paddedWavBlob), undefined, 60)
           return
         }
       }
     }
     const emitWithBlob = (ev: 'record-pause' | 'record-end') => {
       const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType })
+      //this.forceDownload(blob, 'pcmFromMediaRecorder.wav')
       this.emit(ev, blob)
       if (this.options.renderRecordedAudio) {
         this.applyOriginalOptionsIfNeeded()
         //console.log('tester recordedChunks', recordedChunks)
         this.options.workerContext?.postMessage({
-          cmd: 'export-wav2',
+          cmd: 'merge-pcm',
           buf: recordedChunksPCM,
         })
         //this.wavesurfer?.load(URL.createObjectURL(blob), undefined, 60)
@@ -457,6 +586,166 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.lastStartTime = performance.now()
       this.emit('record-resume')
     }
+  }
+
+  // ── Non-destructive editing API ──────────────────────────────────
+
+  public hasOriginalPcm(): boolean {
+    return this.originalPcm !== null
+  }
+
+  public getOriginalPcm(): Float32Array[] | null {
+    return this.originalPcm
+  }
+
+  public getSampleRate(): number {
+    return this.pcmSampleRate
+  }
+
+  public getEdits(): AudioEdit[] {
+    return this.edits
+  }
+
+  public importOriginalPcm(pcm: Float32Array[], sampleRate: number) {
+    this.originalPcm = pcm
+    this.pcmSampleRate = sampleRate
+    this.edits = []
+  }
+
+  public importEdits(edits: AudioEdit[]) {
+    this.edits = edits
+    this.recomputeAndReload()
+  }
+
+  /** Delete a region by edited-time coordinates (local user). Returns edit data for history. */
+  public deleteRegion(startTime: number, endTime: number): { id: string; startSample: number; endSample: number; startTime: number; endTime: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'delete', startSample: startOriginal, endSample: endOriginal }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return {
+      id,
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime: startOriginal / this.pcmSampleRate,
+      endTime: endOriginal / this.pcmSampleRate,
+    }
+  }
+
+  /** Delete a region by original PCM sample coordinates (from peer). */
+  public deleteRegionByOriginalSamples(startSample: number, endSample: number, editId?: string) {
+    const id = editId || crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'delete', startSample, endSample }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Restore (undo) an edit by its ID. Returns the removed edit data or null. */
+  public restoreEdit(editId: string): AudioEdit | null {
+    const idx = this.edits.findIndex((e) => e.id === editId)
+    if (idx === -1) return null
+    const [removed] = this.edits.splice(idx, 1)
+    this.recomputeAndReload()
+    return removed
+  }
+
+  private recomputeAndReload() {
+    if (!this.originalPcm || !this.wavesurfer) return
+
+    const effectivePcm = this.computeEffectiveAudio()
+    if (effectivePcm[0].length > 0) {
+      const wavBlob = this.convertPCMToWAV(effectivePcm)
+      this.wavesurfer.loadBlob(wavBlob)
+    } else {
+      this.wavesurfer.empty()
+    }
+  }
+
+  private editedToOriginal(editedSample: number): number {
+    const ranges = this.mergeOverlappingRanges()
+    let offset = 0
+
+    for (const range of ranges) {
+      const editedCutPoint = range.startSample - offset
+      if (editedSample < editedCutPoint) break
+      offset += range.endSample - range.startSample
+    }
+
+    return editedSample + offset
+  }
+
+  private computeEffectiveAudio(): Float32Array[] {
+    if (!this.originalPcm) return []
+    const ranges = this.mergeOverlappingRanges()
+    if (ranges.length === 0) {
+      return this.originalPcm.map((ch) => new Float32Array(ch))
+    }
+
+    const originalLength = this.originalPcm[0].length
+
+    let totalDeleted = 0
+    for (const range of ranges) {
+      const start = Math.max(0, Math.min(range.startSample, originalLength))
+      const end = Math.max(0, Math.min(range.endSample, originalLength))
+      totalDeleted += end - start
+    }
+
+    const newLength = originalLength - totalDeleted
+    if (newLength <= 0) {
+      return this.originalPcm.map(() => new Float32Array(0))
+    }
+
+    return this.originalPcm.map((channel) => {
+      const result = new Float32Array(newLength)
+      let writePos = 0
+      let readPos = 0
+
+      for (const range of ranges) {
+        const start = Math.max(0, Math.min(range.startSample, originalLength))
+        const end = Math.max(0, Math.min(range.endSample, originalLength))
+
+        if (readPos < start) {
+          result.set(channel.subarray(readPos, start), writePos)
+          writePos += start - readPos
+        }
+        readPos = end
+      }
+
+      if (readPos < originalLength) {
+        result.set(channel.subarray(readPos), writePos)
+      }
+
+      return result
+    })
+  }
+
+  private mergeOverlappingRanges(): SampleRange[] {
+    const deletes = this.edits
+      .filter((e) => e.type === 'delete')
+      .map((e) => ({ startSample: e.startSample, endSample: e.endSample }))
+      .sort((a, b) => a.startSample - b.startSample)
+
+    if (deletes.length === 0) return []
+
+    const merged: SampleRange[] = [deletes[0]]
+    for (let i = 1; i < deletes.length; i++) {
+      const last = merged[merged.length - 1]
+      const curr = deletes[i]
+      if (curr.startSample <= last.endSample) {
+        last.endSample = Math.max(last.endSample, curr.endSample)
+      } else {
+        merged.push({ ...curr })
+      }
+    }
+    return merged
   }
 
   /** Get a list of available audio devices
