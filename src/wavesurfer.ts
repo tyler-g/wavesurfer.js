@@ -467,8 +467,11 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   }
 
   private async loadAudio(url: string, blob?: Blob, channelData?: WaveSurferOptions['peaks'], duration?: number) {
+    // Abort any in-flight load so the new one always wins
+    this.abortController?.abort()
+    this.abortController = null
+
     this.emit('load', url)
-    console.log('loadAudio | url', url, blob, channelData, duration);
     if (!this.options.media && this.isPlaying()) this.pause()
 
     this.decodedData = null
@@ -476,7 +479,6 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Fetch the entire audio as a blob if pre-decoded data is not provided
     if (!blob && !channelData) {
-      console.log('loadAudio | !blob && !channelData');
       const fetchParams = this.options.fetchParams || {}
       if (window.AbortController && !fetchParams.signal) {
         this.abortController = new AbortController()
@@ -492,7 +494,6 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Set the mediaelement source
     this.setSrc(url, blob)
-    console.log('loadAudio | setSrc', url, blob);
 
     // Wait for the audio duration
     const audioDuration = await new Promise<number>((resolve) => {
@@ -508,25 +509,17 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     // Set the duration if the player is a WebAudioPlayer without a URL
     if (!url && !blob) {
-      console.log('loadAudio | !url && !blob');
       const media = this.getMediaElement()
       if (media instanceof WebAudioPlayer) {
         media.duration = audioDuration
       }
     }
 
-    // test hardcode to 60 seconds
-    console.log('loadAudio | audioDuration', audioDuration)
-
     // Decode the audio data or use user-provided peaks
     if (channelData) {
       this.decodedData = Decoder.createBuffer(channelData, audioDuration || 0)
     } else if (blob) {
-      console.log('loadAudio |blob', blob)
       const arrayBuffer = await blob.arrayBuffer()
-      // sample rate is 8000 by default or whatever mediaRecorder is set to.  If this is a wav it should be high quality?
-      // this is only being used to pass to the renderer, so maybe sample rate doesn't matter?
-      console.log('loadAudio | decoding arrayBuffer at sampleRate', this.options.sampleRate)
       this.decodedData = await Decoder.decode(arrayBuffer, this.options.sampleRate)
     }
 

@@ -84,12 +84,16 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private duration = 0
   private micStream: MicStream | null = null
   private unsubscribeDestroy?: () => void
-  private unsubscribeRecordEnd?: () => void
 
   // Non-destructive editing state
   private originalPcm: Float32Array[] | null = null
   private pcmSampleRate: number = 44100
   private edits: AudioEdit[] = []
+
+  // Punch-in recording state
+  private punchInSample: number | null = null
+  private punchInTimeSec: number = 0
+  private existingAudioForPunchIn: Float32Array[] | null = null
 
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
@@ -175,6 +179,29 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
             ? Math.round(this.options.continuousWaveformDuration * FPS)
             : (this.wavesurfer?.getWidth() ?? 0) * window.devicePixelRatio
           this.dataWindow = new Float32Array(size)
+
+          // Punch-in: pre-fill with existing audio peaks so the waveform
+          // shows the original audio, then overwrite from the punch-in point
+          if (this.punchInSample !== null && this.existingAudioForPunchIn) {
+            const existingSampleRate = this.options.audioContext?.sampleRate || this.pcmSampleRate
+            const samplesPerPeak = Math.floor(existingSampleRate / FPS)
+            const channel = this.existingAudioForPunchIn[0]
+            const numPeaks = Math.min(Math.ceil(channel.length / samplesPerPeak), size)
+
+            for (let i = 0; i < numPeaks; i++) {
+              let peak = 0
+              const start = i * samplesPerPeak
+              const end = Math.min(start + samplesPerPeak, channel.length)
+              for (let j = start; j < end; j++) {
+                const v = Math.abs(channel[j])
+                if (v > peak) peak = v
+              }
+              this.dataWindow[i] = peak
+            }
+
+            // Start writing live data from the punch-in position
+            sampleIdx = Math.round(this.punchInSample / samplesPerPeak)
+          }
         }
 
         let maxValue = 0
@@ -208,7 +235,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
           )
           .then(() => {
             if (this.wavesurfer && this.options.continuousWaveform) {
-              this.wavesurfer.setTime(this.getDuration() / 1000)
+              this.wavesurfer.setTime(this.punchInTimeSec + this.getDuration() / 1000)
 
               if (!this.wavesurfer.options.minPxPerSec) {
                 this.wavesurfer.setOptions({
@@ -261,10 +288,26 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const micStream = this.renderMicStream(stream)
     this.micStream = micStream
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
-    this.unsubscribeRecordEnd = this.once('record-end', micStream.onEnd)
     this.stream = stream
     this.source = micStream.source
 
+    return stream
+  }
+
+  /** Activate the microphone without rendering a waveform. Used to pre-warm the mic on arm. */
+  public async prewarmMic(options?: RecordPluginDeviceOptions): Promise<MediaStream> {
+    if (this.stream) return this.stream
+
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: options ?? true,
+      })
+    } catch (err) {
+      throw new Error('Error accessing the microphone: ' + (err as Error).message)
+    }
+
+    this.stream = stream
     return stream
   }
 
@@ -272,10 +315,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   public stopMic() {
     this.micStream?.onDestroy()
     this.unsubscribeDestroy?.()
-    this.unsubscribeRecordEnd?.()
     this.micStream = null
     this.unsubscribeDestroy = undefined
-    this.unsubscribeRecordEnd = undefined
     if (!this.stream) return
     this.stream.getTracks().forEach((track) => track.stop())
     this.stream = null
@@ -461,6 +502,21 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   /** Start recording audio from the microphone */
   public async startRecording(options?: RecordPluginDeviceOptions) {
     const stream = this.stream || (await this.startMic(options))
+
+    // Clean up old micStream rendering (interval, source, analyser) but keep the stream alive
+    if (this.micStream) {
+      this.micStream.onDestroy()
+      this.unsubscribeDestroy?.()
+      this.micStream = null
+      this.unsubscribeDestroy = undefined
+    }
+
+    // Create fresh rendering for this recording (new source, analyser, sampleIdx closure)
+    const micStream = this.renderMicStream(stream)
+    this.micStream = micStream
+    this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
+    this.source = micStream.source
+
     this.dataWindow = null
     const mediaRecorder =
       this.mediaRecorder ||
@@ -498,13 +554,30 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         }
         if (e.data.cmd === 'pcm-data') {
           console.log('record plugin | received pcm data', e.data.pcm)
-          // Store the original PCM internally for non-destructive editing
-          this.originalPcm = e.data.pcm
-          this.pcmSampleRate = this.options.audioContext?.sampleRate || 44100
-          this.edits = []
-          this.emit('record-pcm-data' as any, e.data.pcm)
 
-          const paddedWavBlob = this.padPCMToDuration(e.data.pcm, 60)
+          let finalPcm: Float32Array[] = e.data.pcm
+
+          // Capture timing info before punch-in state is reset
+          const startTime = this.punchInTimeSec
+          const sampleRate = this.options.audioContext?.sampleRate || 44100
+
+          // If punch-in was set, stitch the new recording with existing audio
+          if (this.punchInSample !== null) {
+            finalPcm = this.stitchPunchIn(e.data.pcm)
+            this.punchInSample = null
+            this.punchInTimeSec = 0
+            this.existingAudioForPunchIn = null
+          }
+
+          // Store the original PCM internally for non-destructive editing
+          this.originalPcm = finalPcm
+          this.pcmSampleRate = sampleRate
+          this.edits = []
+
+          const endTime = startTime + (finalPcm[0].length / sampleRate)
+          this.emit('record-pcm-data' as any, { pcm: finalPcm, startTime, endTime })
+
+          const paddedWavBlob = this.padPCMToDuration(finalPcm, 60)
           this.wavesurfer?.load(URL.createObjectURL(paddedWavBlob), undefined, 60)
           return
         }
@@ -561,6 +634,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   /** Stop the recording */
   public stopRecording() {
     if (this.isActive()) {
+      this.isWaveformPaused = true
       this.mediaRecorder?.stop()
       this.timer.stop()
     }
@@ -586,6 +660,71 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.lastStartTime = performance.now()
       this.emit('record-resume')
     }
+  }
+
+  // ── Punch-in recording API ──────────────────────────────────────
+
+  public setPunchInPosition(cursorTimeSec: number) {
+    const sampleRate = this.options.audioContext?.sampleRate || this.pcmSampleRate
+    this.punchInSample = Math.round(cursorTimeSec * sampleRate)
+    this.punchInTimeSec = cursorTimeSec
+    if (this.hasOriginalPcm()) {
+      // Use the original PCM with edits applied
+      this.existingAudioForPunchIn = this.computeEffectiveAudio()
+    } else if (this.wavesurfer) {
+      // No originalPcm (audio loaded from file, not from a recording) —
+      // grab whatever is currently in the WaveSurfer decoded buffer
+      const decodedData = this.wavesurfer.getDecodedData()
+      if (decodedData) {
+        const channels: Float32Array[] = []
+        for (let i = 0; i < decodedData.numberOfChannels; i++) {
+          channels.push(new Float32Array(decodedData.getChannelData(i)))
+        }
+        this.existingAudioForPunchIn = channels
+      } else {
+        this.existingAudioForPunchIn = null
+      }
+    } else {
+      this.existingAudioForPunchIn = null
+    }
+  }
+
+  private stitchPunchIn(newPcm: Float32Array[]): Float32Array[] {
+    if (this.punchInSample === null) return newPcm
+
+    const punchIn = this.punchInSample
+    const existing = this.existingAudioForPunchIn
+
+    return newPcm.map((newChannel, ch) => {
+      const existingChannel = existing?.[ch] || null
+      const existingLen = existingChannel?.length || 0
+      const newLen = newChannel.length
+
+      // post = existing audio after the punch-out point
+      const postStart = punchIn + newLen
+      const postLen = existingLen > postStart ? existingLen - postStart : 0
+
+      const totalLen = punchIn + newLen + postLen
+      const result = new Float32Array(totalLen)
+
+      // Copy pre segment from existing (or leave as silence zeros)
+      if (existingChannel) {
+        const preLen = Math.min(punchIn, existingLen)
+        if (preLen > 0) {
+          result.set(existingChannel.subarray(0, preLen), 0)
+        }
+      }
+
+      // Copy new recorded audio at punch-in position
+      result.set(newChannel, punchIn)
+
+      // Copy post segment from existing
+      if (postLen > 0 && existingChannel) {
+        result.set(existingChannel.subarray(postStart), punchIn + newLen)
+      }
+
+      return result
+    })
   }
 
   // ── Non-destructive editing API ──────────────────────────────────
@@ -615,6 +754,12 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   public importEdits(edits: AudioEdit[]) {
     this.edits = edits
     this.recomputeAndReload()
+  }
+
+  /** Set edits without triggering recomputeAndReload. Used when wavesurfer
+   *  already has the correct rendered audio (e.g. loaded via P2P sync). */
+  public setEdits(edits: AudioEdit[]) {
+    this.edits = edits
   }
 
   /** Delete a region by edited-time coordinates (local user). Returns edit data for history. */
