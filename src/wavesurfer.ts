@@ -675,6 +675,13 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     this.initPlayerEvents()
   }
 
+  /** Insert a custom output node between the gain node and destination (WebAudio backend only) */
+  public setOutputNode(node: AudioNode) {
+    if (this.media instanceof WebAudioPlayer) {
+      ;(this.media as unknown as WebAudioPlayer).setOutputNode(node)
+    }
+  }
+
   /**
    * Export the waveform image as a data-URI or a blob.
    *

@@ -18,6 +18,7 @@ type WebAudioPlayerEvents = {
 class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   private audioContext: AudioContext
   private gainNode: GainNode
+  private outputNode: AudioNode
   private bufferNode: AudioBufferSourceNode | null = null
   private playStartTime = 0
   private playedDuration = 0
@@ -34,8 +35,9 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   constructor(audioContext = new AudioContext()) {
     super()
     this.audioContext = audioContext
+    this.outputNode = this.audioContext.destination
     this.gainNode = this.audioContext.createGain()
-    this.gainNode.connect(this.audioContext.destination)
+    this.gainNode.connect(this.outputNode)
   }
 
   /** Subscribe to an event. Returns an unsubscribe function. */
@@ -206,7 +208,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     if (this._muted) {
       this.gainNode.disconnect()
     } else {
-      this.gainNode.connect(this.audioContext.destination)
+      this.gainNode.connect(this.outputNode)
     }
   }
 
@@ -217,6 +219,15 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   /** Get the GainNode used to play the audio. Can be used to attach filters. */
   public getGainNode(): GainNode {
     return this.gainNode
+  }
+
+  /** Set a custom output node (e.g. StereoPannerNode) between the gain and destination. */
+  public setOutputNode(node: AudioNode) {
+    if (!this._muted) {
+      this.gainNode.disconnect()
+      this.gainNode.connect(node)
+    }
+    this.outputNode = node
   }
 
   /** Get decoded audio */
