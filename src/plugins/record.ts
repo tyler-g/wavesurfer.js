@@ -58,6 +58,12 @@ type AudioEdit = {
   startSample: number
   endSample: number
   gain?: number
+  // Limiter params
+  threshold?: number
+  makeupTarget?: number
+  kneeWidth?: number
+  lookaheadMs?: number
+  releaseMs?: number
 }
 
 type SampleRange = {
@@ -837,6 +843,60 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
+  /** Apply limiter to a region (local path — times in edited space). */
+  public limiterRegion(
+    startTime: number,
+    endTime: number,
+    params: { threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number },
+  ): { id: string; startSample: number; endSample: number; threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = {
+      id,
+      type: 'limiter',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      threshold: params.threshold,
+      makeupTarget: params.makeupTarget,
+      kneeWidth: params.kneeWidth,
+      lookaheadMs: params.lookaheadMs,
+      releaseMs: params.releaseMs,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, ...params }
+  }
+
+  /** Apply limiter to a region by original PCM sample coordinates (from peer). */
+  public limiterRegionByOriginalSamples(
+    startSample: number,
+    endSample: number,
+    params: { threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number },
+    editId?: string,
+  ) {
+    const id = editId || crypto.randomUUID()
+    const edit: AudioEdit = {
+      id,
+      type: 'limiter',
+      startSample,
+      endSample,
+      threshold: params.threshold,
+      makeupTarget: params.makeupTarget,
+      kneeWidth: params.kneeWidth,
+      lookaheadMs: params.lookaheadMs,
+      releaseMs: params.releaseMs,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
   /** Restore (undo) an edit by its ID. Returns the removed edit data or null. */
   public restoreEdit(editId: string): AudioEdit | null {
     const idx = this.edits.findIndex((e) => e.id === editId)
@@ -955,6 +1015,82 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         for (let ch = 0; ch < result.length; ch++) {
           for (let i = start; i < end; i++) {
             result[ch][i] *= factor
+          }
+        }
+      }
+    }
+
+    // Apply limiter edits
+    const limiterEdits = this.edits.filter((e) => e.type === 'limiter')
+    if (limiterEdits.length > 0) {
+      for (const edit of limiterEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+
+        const threshold = edit.threshold ?? -5
+        const makeupTarget = edit.makeupTarget ?? -1
+        const kneeWidth = edit.kneeWidth ?? 2
+        const lookaheadMs = edit.lookaheadMs ?? 1
+        const releaseMs = edit.releaseMs ?? 20
+        const halfKnee = kneeWidth / 2
+        const lookaheadSamples = Math.max(0, Math.round((lookaheadMs / 1000) * this.pcmSampleRate))
+        const releaseCoeff = releaseMs > 0 ? Math.exp(-1 / ((releaseMs / 1000) * this.pcmSampleRate)) : 0
+        const makeupGainLinear = Math.pow(10, (makeupTarget - threshold) / 20)
+
+        for (let ch = 0; ch < result.length; ch++) {
+          const data = result[ch]
+          const regionLen = end - start
+          const gainReductionDb = new Float32Array(regionLen)
+
+          // Pass 1: compute per-sample gain reduction
+          for (let i = 0; i < regionLen; i++) {
+            const sample = Math.abs(data[start + i])
+            const inputDb = sample > 0 ? 20 * Math.log10(sample) : -120
+            let outputDb: number
+            if (inputDb <= threshold - halfKnee) {
+              outputDb = inputDb
+            } else if (inputDb >= threshold + halfKnee) {
+              outputDb = threshold
+            } else {
+              const x = inputDb - threshold + halfKnee
+              outputDb = inputDb - (x * x) / (2 * kneeWidth)
+            }
+            gainReductionDb[i] = outputDb - inputDb
+          }
+
+          // Pass 2: lookahead
+          if (lookaheadSamples > 0) {
+            const smoothed = new Float32Array(regionLen)
+            for (let i = 0; i < regionLen; i++) {
+              let minGr = gainReductionDb[i]
+              const lookEnd = Math.min(regionLen, i + lookaheadSamples)
+              for (let j = i + 1; j < lookEnd; j++) {
+                if (gainReductionDb[j] < minGr) minGr = gainReductionDb[j]
+              }
+              smoothed[i] = minGr
+            }
+            gainReductionDb.set(smoothed)
+          }
+
+          // Pass 3: release envelope
+          let envelopeDb = 0
+          for (let i = 0; i < regionLen; i++) {
+            const target = gainReductionDb[i]
+            if (target < envelopeDb) {
+              envelopeDb = target
+            } else {
+              envelopeDb = target + releaseCoeff * (envelopeDb - target)
+            }
+            gainReductionDb[i] = envelopeDb
+          }
+
+          // Pass 4: apply
+          for (let i = 0; i < regionLen; i++) {
+            const grLinear = Math.pow(10, gainReductionDb[i] / 20)
+            data[start + i] *= grLinear * makeupGainLinear
           }
         }
       }
