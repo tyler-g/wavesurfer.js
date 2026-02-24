@@ -692,6 +692,156 @@ class Renderer extends EventEmitter<RendererEvents> {
     Promise.resolve().then(() => this.emit('rendered'))
   }
 
+  /** Lightweight render that reuses existing canvas DOM elements instead of destroying/recreating them.
+   *  Used during recording to avoid the performance cliff from innerHTML='' at 60fps. */
+  renderUpdate(audioData: AudioBuffer) {
+    this.audioData = audioData
+
+    const pixelRatio = this.getPixelRatio()
+    const parentWidth = this.scrollContainer.clientWidth
+    const scrollWidth = Math.ceil(audioData.duration * (this.options.minPxPerSec || 0))
+
+    this.isScrollable = scrollWidth > parentWidth
+    const useParentWidth = this.options.fillParent && !this.isScrollable
+    const width = (useParentWidth ? parentWidth : scrollWidth) * pixelRatio
+    const totalWidth = width / pixelRatio
+
+    // Update wrapper width (DOM write only, no read)
+    this.wrapper.style.width = useParentWidth ? '100%' : `${scrollWidth}px`
+    this.scrollContainer.style.overflowX = this.isScrollable ? 'auto' : 'hidden'
+
+    // Get existing channel containers
+    const canvasContainers = Array.from(this.canvasWrapper.children) as HTMLElement[]
+    const progressContainers = Array.from(this.progressWrapper.children) as HTMLElement[]
+
+    if (canvasContainers.length === 0) {
+      // No existing canvases — fall back to full render
+      this.render(audioData)
+      return
+    }
+
+    const channelCount = this.options.splitChannels ? audioData.numberOfChannels : 1
+
+    for (let ch = 0; ch < channelCount && ch < canvasContainers.length; ch++) {
+      const canvasContainer = canvasContainers[ch]
+      const progressContainer = progressContainers[ch]
+      if (!canvasContainer || !progressContainer) continue
+
+      const options = this.options.splitChannels
+        ? { ...this.options, ...this.options.splitChannels?.[ch] }
+        : this.options
+
+      // Get channel data
+      let channelData: Array<Float32Array | number[]>
+      if (this.options.splitChannels) {
+        channelData = [audioData.getChannelData(ch)]
+      } else {
+        channelData = [audioData.getChannelData(0)]
+        if (audioData.numberOfChannels > 1) channelData.push(audioData.getChannelData(1))
+      }
+
+      const height = this.getHeight(options.height, options.splitChannels)
+      const singleCanvasWidth = Math.min(Renderer.MAX_CANVAS_WIDTH, parentWidth, totalWidth)
+      if (singleCanvasWidth <= 0) continue
+
+      const numCanvases = Math.ceil(totalWidth / singleCanvasWidth)
+      const existingCanvases = Array.from(canvasContainer.querySelectorAll('canvas')) as HTMLCanvasElement[]
+      const existingProgressCanvases = Array.from(progressContainer.querySelectorAll('canvas')) as HTMLCanvasElement[]
+
+      // Determine which canvases to draw
+      let startIdx: number, endIdx: number
+      if (this.isScrollable) {
+        // Draw canvases around the current viewport position
+        const viewPosition = this.scrollContainer.scrollLeft / totalWidth
+        const centerCanvas = Math.floor(viewPosition * numCanvases)
+        startIdx = Math.max(0, centerCanvas - 1)
+        endIdx = Math.min(numCanvases - 1, centerCanvas + 2)
+      } else {
+        startIdx = 0
+        endIdx = numCanvases - 1
+      }
+
+      const neededCount = endIdx - startIdx + 1
+
+      // Ensure we have enough canvas elements (add if needed, never remove)
+      while (existingCanvases.length < neededCount) {
+        const canvas = document.createElement('canvas')
+        canvas.height = Math.round(height * pixelRatio)
+        canvas.style.height = `${height}px`
+        canvasContainer.appendChild(canvas)
+        existingCanvases.push(canvas)
+
+        const progressCanvas = document.createElement('canvas')
+        progressCanvas.height = Math.round(height * pixelRatio)
+        progressCanvas.style.height = `${height}px`
+        progressContainer.appendChild(progressCanvas)
+        existingProgressCanvases.push(progressCanvas)
+      }
+
+      // Clear and redraw visible canvases
+      for (let n = 0; n < neededCount; n++) {
+        const canvasIdx = startIdx + n
+        const canvas = existingCanvases[n]
+        const progressCanvas = existingProgressCanvases[n]
+        if (!canvas) continue
+
+        const offset = canvasIdx * singleCanvasWidth
+        const clampedWidth = Math.min(totalWidth - offset, singleCanvasWidth)
+
+        const newPixelWidth = Math.round(clampedWidth * pixelRatio)
+        const newPixelHeight = Math.round(height * pixelRatio)
+
+        // Resize canvas only if dimensions actually changed
+        if (canvas.width !== newPixelWidth || canvas.height !== newPixelHeight) {
+          canvas.width = newPixelWidth
+          canvas.height = newPixelHeight
+          canvas.style.width = `${Math.round(clampedWidth)}px`
+          canvas.style.height = `${height}px`
+        }
+        canvas.style.left = `${Math.round(offset)}px`
+
+        const ctx = canvas.getContext('2d')
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height)
+          const start = Math.floor((offset / totalWidth) * channelData[0].length)
+          const end = Math.floor(((offset + clampedWidth) / totalWidth) * channelData[0].length)
+          const data = channelData.map((c) => c.slice(start, end))
+          this.renderWaveform(data, options, ctx)
+        }
+
+        // Update progress canvas
+        if (progressCanvas && canvas.width > 0 && canvas.height > 0) {
+          if (progressCanvas.width !== canvas.width || progressCanvas.height !== canvas.height) {
+            progressCanvas.width = canvas.width
+            progressCanvas.height = canvas.height
+            progressCanvas.style.width = canvas.style.width
+            progressCanvas.style.height = canvas.style.height
+          }
+          progressCanvas.style.left = canvas.style.left
+
+          const progressCtx = progressCanvas.getContext('2d')
+          if (progressCtx) {
+            // Reset composite op — it persists from the previous frame as 'source-in'
+            progressCtx.globalCompositeOperation = 'source-over'
+            progressCtx.clearRect(0, 0, progressCanvas.width, progressCanvas.height)
+            progressCtx.drawImage(canvas, 0, 0)
+            progressCtx.globalCompositeOperation = 'source-in'
+            progressCtx.fillStyle = this.convertColorValues(options.progressColor)
+            progressCtx.fillRect(0, 0, progressCanvas.width, progressCanvas.height)
+          }
+        }
+      }
+
+      // Zero-out extra canvases that aren't needed
+      for (let n = neededCount; n < existingCanvases.length; n++) {
+        if (existingCanvases[n].width !== 0) existingCanvases[n].width = 0
+        if (existingProgressCanvases[n]?.width !== 0) existingProgressCanvases[n].width = 0
+      }
+    }
+
+    // Scrolling is handled by the caller (updatePeaks) after setting cursor position
+  }
+
   reRender() {
     this.unsubscribeOnScroll.forEach((unsubscribe) => unsubscribe())
     this.unsubscribeOnScroll = []
@@ -760,7 +910,7 @@ class Renderer extends EventEmitter<RendererEvents> {
     }
   }
 
-  renderProgress(progress: number, isPlaying?: boolean) {
+  renderProgress(progress: number, isPlaying?: boolean, skipScroll?: boolean) {
     if (isNaN(progress)) return
     const percents = progress * 100
     this.canvasWrapper.style.clipPath = `polygon(${percents}% 0%, 100% 0%, 100% 100%, ${percents}% 100%)`
@@ -770,7 +920,7 @@ class Renderer extends EventEmitter<RendererEvents> {
       ? `translateX(-${progress * this.options.cursorWidth}px)`
       : ''
 
-    if (this.isScrollable && this.options.autoScroll) {
+    if (!skipScroll && this.isScrollable && this.options.autoScroll) {
       this.scrollIntoView(progress, isPlaying)
     }
   }

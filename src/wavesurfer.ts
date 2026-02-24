@@ -546,6 +546,46 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
   }
 
+  /** Lightweight peaks update — reuses existing canvas DOM elements instead of full load().
+   *  Used during recording to avoid the performance cliff from destroying/recreating DOM at 60fps.
+   *  Updates the waveform data, cursor position, and scroll in a single efficient call. */
+  public updatePeaks(channelData: WaveSurferOptions['peaks'], duration: number, currentTime?: number) {
+    if (!channelData) return
+    this.decodedData = Decoder.createBuffer(channelData, duration)
+
+    // Update media duration for WebAudioPlayer
+    const media = this.getMediaElement()
+    if (media instanceof WebAudioPlayer) {
+      media.duration = duration
+    }
+
+    // Update cursor/progress position BEFORE rendering so renderUpdate
+    // can draw canvases around the correct viewport
+    if (currentTime !== undefined && duration > 0) {
+      const progress = Math.min(1, currentTime / duration)
+
+      // Scroll to keep cursor centered (direct write — no layout reads needed)
+      const minPxPerSec = this.options.minPxPerSec || 0
+      const scrollWidth = Math.ceil(duration * minPxPerSec)
+      const clientWidth = this.getWidth()
+      if (scrollWidth > clientWidth) {
+        const cursorPosition = currentTime * minPxPerSec
+        const targetScroll = cursorPosition - clientWidth / 2
+        this.setScroll(Math.max(0, Math.min(targetScroll, scrollWidth - clientWidth)))
+      }
+
+      // Render the waveform canvases (uses current scrollLeft to determine visible canvases)
+      if (this.decodedData) {
+        this.renderer.renderUpdate(this.decodedData)
+      }
+
+      // Update cursor/progress visual (skipScroll — we already scrolled above)
+      this.renderer.renderProgress(progress, false, true)
+    } else if (this.decodedData) {
+      this.renderer.renderUpdate(this.decodedData)
+    }
+  }
+
   /** Load an audio blob */
   public async loadBlob(blob: Blob, channelData?: WaveSurferOptions['peaks'], duration?: number) {
     try {

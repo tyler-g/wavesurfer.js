@@ -95,6 +95,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private punchInTimeSec: number = 0
   private existingAudioForPunchIn: Float32Array[] | null = null
 
+  // Channel count for PCM data (set before recording for stereo tracks)
+  private recordingChannels: number = 1
+
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
     super({
@@ -129,6 +132,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return this.source
   }
 
+  /** Set the number of channels for the PCM recording pipeline (default 1 = mono) */
+  public setRecordingChannels(channels: number) {
+    this.recordingChannels = channels
+  }
+
   public renderMicStream(stream: MediaStream): MicStream {
     const audioContext = this.options.audioContext || new AudioContext()
     let source = audioContext.createMediaStreamSource(stream)
@@ -142,6 +150,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const dataArray = new Float32Array(bufferLength)
 
     let sampleIdx = 0
+    let hasInitialRender = false
 
     if (this.wavesurfer) {
       this.originalOptions ??= {
@@ -227,26 +236,34 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       // Render the waveform
       if (this.wavesurfer) {
         const totalDuration = (this.dataWindow?.length ?? 0) / FPS
-        this.wavesurfer
-          .load(
-            '',
-            [this.dataWindow],
-            this.options.scrollingWaveform ? this.options.scrollingWaveformWindow : totalDuration,
-          )
-          .then(() => {
-            if (this.wavesurfer && this.options.continuousWaveform) {
-              this.wavesurfer.setTime(this.punchInTimeSec + this.getDuration() / 1000)
+        const duration = this.options.scrollingWaveform ? this.options.scrollingWaveformWindow : totalDuration
 
-              if (!this.wavesurfer.options.minPxPerSec) {
-                this.wavesurfer.setOptions({
-                  minPxPerSec: this.wavesurfer.getWidth() / this.wavesurfer.getDuration(),
-                })
+        if (!hasInitialRender) {
+          // First frame: full load to set up DOM structure, events, media
+          this.wavesurfer
+            .load('', [this.dataWindow], duration)
+            .then(() => {
+              if (this.wavesurfer && this.options.continuousWaveform) {
+                this.wavesurfer.setTime(this.punchInTimeSec + this.getDuration() / 1000)
+
+                if (!this.wavesurfer.options.minPxPerSec) {
+                  this.wavesurfer.setOptions({
+                    minPxPerSec: this.wavesurfer.getWidth() / this.wavesurfer.getDuration(),
+                  })
+                }
               }
-            }
-          })
-          .catch((err) => {
-            console.error('Error rendering real-time recording data:', err)
-          })
+              hasInitialRender = true
+            })
+            .catch((err) => {
+              console.error('Error rendering real-time recording data:', err)
+            })
+        } else {
+          // Subsequent frames: lightweight update — reuses canvas DOM, no events, no layout thrashing
+          const currentTime = this.options.continuousWaveform
+            ? this.punchInTimeSec + this.getDuration() / 1000
+            : undefined
+          this.wavesurfer.updatePeaks([this.dataWindow!], duration || 0, currentTime)
+        }
       }
     }
 
@@ -593,6 +610,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         this.options.workerContext?.postMessage({
           cmd: 'merge-pcm',
           buf: recordedChunksPCM,
+          channels: this.recordingChannels,
         })
         //this.wavesurfer?.load(URL.createObjectURL(blob), undefined, 60)
         //this.wavesurfer?.load(URL.createObjectURL(blob))
