@@ -117,7 +117,7 @@ class SingleRegion extends EventEmitter<RegionEvents> implements Region {
     this.resize = params.resize ?? true
     this.resizeStart = params.resizeStart ?? true
     this.resizeEnd = params.resizeEnd ?? true
-    this.color = params.color ?? 'rgba(0, 0, 0, 0.1)'
+    this.color = params.color ?? 'rgba(71, 183, 132, 0.2)'
     this.minLength = params.minLength ?? this.minLength
     this.maxLength = params.maxLength ?? this.maxLength
     this.channelIdx = params.channelIdx ?? -1
@@ -157,7 +157,7 @@ class SingleRegion extends EventEmitter<RegionEvents> implements Region {
         style: {
           ...handleStyle,
           left: '0',
-          borderLeft: '2px solid rgba(0, 0, 0, 0.5)',
+          borderLeft: '2px solid rgba(71, 183, 132, 0.7)',
           borderRadius: '2px 0 0 2px',
         },
       },
@@ -171,7 +171,7 @@ class SingleRegion extends EventEmitter<RegionEvents> implements Region {
         style: {
           ...handleStyle,
           right: '0',
-          borderRight: '2px solid rgba(0, 0, 0, 0.5)',
+          borderRight: '2px solid rgba(71, 183, 132, 0.7)',
           borderRadius: '0 2px 2px 0',
         },
       },

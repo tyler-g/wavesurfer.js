@@ -57,6 +57,7 @@ type AudioEdit = {
   type: string
   startSample: number
   endSample: number
+  gain?: number
 }
 
 type SampleRange = {
@@ -811,6 +812,31 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
+  /** Amplify a region by edited-time coordinates (local user). Returns edit data for history. */
+  public amplifyRegion(startTime: number, endTime: number, gainDb: number): { id: string; startSample: number; endSample: number; gain: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'amplify', startSample: startOriginal, endSample: endOriginal, gain: gainDb }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, gain: gainDb }
+  }
+
+  /** Amplify a region by original PCM sample coordinates (from peer). */
+  public amplifyRegionByOriginalSamples(startSample: number, endSample: number, gainDb: number, editId?: string) {
+    const id = editId || crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'amplify', startSample, endSample, gain: gainDb }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
   /** Restore (undo) an edit by its ID. Returns the removed edit data or null. */
   public restoreEdit(editId: string): AudioEdit | null {
     const idx = this.edits.findIndex((e) => e.id === editId)
@@ -825,8 +851,20 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     const effectivePcm = this.computeEffectiveAudio()
     if (effectivePcm[0].length > 0) {
+      // Preserve cursor position, zoom, and scroll across reload
+      const currentTime = this.wavesurfer.getCurrentTime()
+      const scrollLeft = this.wavesurfer.getScroll()
+      const minPxPerSec = this.wavesurfer.options.minPxPerSec || 0
+
       const wavBlob = this.convertPCMToWAV(effectivePcm)
-      this.wavesurfer.loadBlob(wavBlob)
+      this.wavesurfer.loadBlob(wavBlob).then(() => {
+        if (!this.wavesurfer) return
+        if (minPxPerSec) {
+          this.wavesurfer.zoom(minPxPerSec)
+        }
+        this.wavesurfer.setTime(currentTime)
+        this.wavesurfer.setScroll(scrollLeft)
+      })
     } else {
       this.wavesurfer.empty()
     }
@@ -845,49 +883,84 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return editedSample + offset
   }
 
-  private computeEffectiveAudio(): Float32Array[] {
-    if (!this.originalPcm) return []
-    const ranges = this.mergeOverlappingRanges()
-    if (ranges.length === 0) {
-      return this.originalPcm.map((ch) => new Float32Array(ch))
-    }
-
-    const originalLength = this.originalPcm[0].length
-
-    let totalDeleted = 0
-    for (const range of ranges) {
+  /** Map an original-space sample index to effective-space (after deletes). Returns -1 if inside a deleted range. */
+  private originalToEffective(originalSample: number, deleteRanges: SampleRange[], originalLength: number): number {
+    let offset = 0
+    for (const range of deleteRanges) {
       const start = Math.max(0, Math.min(range.startSample, originalLength))
       const end = Math.max(0, Math.min(range.endSample, originalLength))
-      totalDeleted += end - start
+      if (originalSample < start) break
+      if (originalSample < end) return -1 // inside a deleted range
+      offset += end - start
     }
+    return originalSample - offset
+  }
 
-    const newLength = originalLength - totalDeleted
-    if (newLength <= 0) {
-      return this.originalPcm.map(() => new Float32Array(0))
-    }
+  private computeEffectiveAudio(): Float32Array[] {
+    if (!this.originalPcm) return []
+    const deleteRanges = this.mergeOverlappingRanges()
+    const amplifyEdits = this.edits.filter((e) => e.type === 'amplify' && e.gain !== undefined)
+    const originalLength = this.originalPcm[0].length
 
-    return this.originalPcm.map((channel) => {
-      const result = new Float32Array(newLength)
-      let writePos = 0
-      let readPos = 0
-
-      for (const range of ranges) {
+    // Apply deletes
+    let result: Float32Array[]
+    if (deleteRanges.length === 0) {
+      result = this.originalPcm.map((ch) => new Float32Array(ch))
+    } else {
+      let totalDeleted = 0
+      for (const range of deleteRanges) {
         const start = Math.max(0, Math.min(range.startSample, originalLength))
         const end = Math.max(0, Math.min(range.endSample, originalLength))
+        totalDeleted += end - start
+      }
 
-        if (readPos < start) {
-          result.set(channel.subarray(readPos, start), writePos)
-          writePos += start - readPos
+      const newLength = originalLength - totalDeleted
+      if (newLength <= 0) {
+        return this.originalPcm.map(() => new Float32Array(0))
+      }
+
+      result = this.originalPcm.map((channel) => {
+        const buf = new Float32Array(newLength)
+        let writePos = 0
+        let readPos = 0
+
+        for (const range of deleteRanges) {
+          const start = Math.max(0, Math.min(range.startSample, originalLength))
+          const end = Math.max(0, Math.min(range.endSample, originalLength))
+
+          if (readPos < start) {
+            buf.set(channel.subarray(readPos, start), writePos)
+            writePos += start - readPos
+          }
+          readPos = end
         }
-        readPos = end
-      }
 
-      if (readPos < originalLength) {
-        result.set(channel.subarray(readPos), writePos)
-      }
+        if (readPos < originalLength) {
+          buf.set(channel.subarray(readPos), writePos)
+        }
 
-      return result
-    })
+        return buf
+      })
+    }
+
+    // Apply amplify edits
+    if (amplifyEdits.length > 0) {
+      for (const edit of amplifyEdits) {
+        const factor = Math.pow(10, (edit.gain ?? 0) / 20)
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        for (let ch = 0; ch < result.length; ch++) {
+          for (let i = start; i < end; i++) {
+            result[ch][i] *= factor
+          }
+        }
+      }
+    }
+
+    return result
   }
 
   private mergeOverlappingRanges(): SampleRange[] {
