@@ -96,6 +96,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private originalPcm: Float32Array[] | null = null
   private pcmSampleRate: number = 44100
   private edits: AudioEdit[] = []
+  /** True while recomputeAndReload is restoring zoom/cursor after a loadBlob.
+   *  AudioTrack event listeners should check this to avoid creating spurious
+   *  history entries (which would truncate the undo/redo stack). */
+  public isReloading: boolean = false
 
   // Punch-in recording state
   private punchInSample: number | null = null
@@ -917,13 +921,18 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       const minPxPerSec = this.wavesurfer.options.minPxPerSec || 0
 
       const wavBlob = this.convertPCMToWAV(effectivePcm)
+      this.isReloading = true
       this.wavesurfer.loadBlob(wavBlob).then(() => {
-        if (!this.wavesurfer) return
+        if (!this.wavesurfer) {
+          this.isReloading = false
+          return
+        }
         if (minPxPerSec) {
           this.wavesurfer.zoom(minPxPerSec)
         }
         this.wavesurfer.setTime(currentTime)
         this.wavesurfer.setScroll(scrollLeft)
+        this.isReloading = false
       })
     } else {
       this.wavesurfer.empty()
