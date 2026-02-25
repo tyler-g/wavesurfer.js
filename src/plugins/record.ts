@@ -988,7 +988,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return removed
   }
 
-  private recomputeAndReload() {
+  public recomputeAndReload() {
     if (!this.originalPcm || !this.wavesurfer) return
 
     const effectivePcm = this.computeEffectiveAudio()

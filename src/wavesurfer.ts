@@ -698,9 +698,26 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     this.setTime(this.getCurrentTime() + seconds)
   }
 
-  /** Empty the waveform */
+  /** Empty the waveform by loading a minimal silent buffer */
   public empty() {
     this.load('', [[0]], 0.001)
+  }
+
+  /** Clear the waveform completely — no audio, no visual artifacts.
+   *  Unlike empty(), this does not load a fake silent buffer. */
+  public clear() {
+    this.decodedData = null
+    const media = this.getMediaElement()
+    if (media && 'duration' in media && typeof (media as any).duration === 'number') {
+      ;(media as any).duration = 0
+    }
+    // Clear all canvas elements in the renderer wrapper
+    const wrapper = this.renderer.getWrapper()
+    const canvases = wrapper.querySelectorAll('canvas')
+    canvases.forEach((c) => {
+      const ctx = c.getContext('2d')
+      if (ctx) ctx.clearRect(0, 0, c.width, c.height)
+    })
   }
 
   /** force rerender of the waveform */
