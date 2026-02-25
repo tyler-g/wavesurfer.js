@@ -57,6 +57,8 @@ type AudioEdit = {
   type: string
   startSample: number
   endSample: number
+  startTime?: number
+  endTime?: number
   gain?: number
   // Limiter params
   threshold?: number
@@ -64,6 +66,10 @@ type AudioEdit = {
   kneeWidth?: number
   lookaheadMs?: number
   releaseMs?: number
+  // Compressor params
+  ratio?: number
+  makeupGainDb?: number
+  attackMs?: number
 }
 
 type SampleRange = {
@@ -801,29 +807,25 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const endOriginal = this.editedToOriginal(endEdited)
 
     const id = crypto.randomUUID()
-    const edit: AudioEdit = { id, type: 'delete', startSample: startOriginal, endSample: endOriginal }
+    const edit: AudioEdit = { id, type: 'delete', startSample: startOriginal, endSample: endOriginal, startTime, endTime }
     this.edits.push(edit)
     this.recomputeAndReload()
 
-    return {
-      id,
-      startSample: startOriginal,
-      endSample: endOriginal,
-      startTime: startOriginal / this.pcmSampleRate,
-      endTime: endOriginal / this.pcmSampleRate,
-    }
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime }
   }
 
   /** Delete a region by original PCM sample coordinates (from peer). */
-  public deleteRegionByOriginalSamples(startSample: number, endSample: number, editId?: string) {
+  public deleteRegionByOriginalSamples(startSample: number, endSample: number, editId?: string, startTime?: number, endTime?: number) {
     const id = editId || crypto.randomUUID()
-    const edit: AudioEdit = { id, type: 'delete', startSample, endSample }
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'delete', startSample, endSample, startTime: st, endTime: et }
     this.edits.push(edit)
     this.recomputeAndReload()
   }
 
   /** Amplify a region by edited-time coordinates (local user). Returns edit data for history. */
-  public amplifyRegion(startTime: number, endTime: number, gainDb: number): { id: string; startSample: number; endSample: number; gain: number } | null {
+  public amplifyRegion(startTime: number, endTime: number, gainDb: number): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; gain: number } | null {
     if (!this.originalPcm) return null
 
     const startEdited = Math.floor(startTime * this.pcmSampleRate)
@@ -832,17 +834,19 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const endOriginal = this.editedToOriginal(endEdited)
 
     const id = crypto.randomUUID()
-    const edit: AudioEdit = { id, type: 'amplify', startSample: startOriginal, endSample: endOriginal, gain: gainDb }
+    const edit: AudioEdit = { id, type: 'amplify', startSample: startOriginal, endSample: endOriginal, startTime, endTime, gain: gainDb }
     this.edits.push(edit)
     this.recomputeAndReload()
 
-    return { id, startSample: startOriginal, endSample: endOriginal, gain: gainDb }
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, gain: gainDb }
   }
 
   /** Amplify a region by original PCM sample coordinates (from peer). */
-  public amplifyRegionByOriginalSamples(startSample: number, endSample: number, gainDb: number, editId?: string) {
+  public amplifyRegionByOriginalSamples(startSample: number, endSample: number, gainDb: number, editId?: string, startTime?: number, endTime?: number) {
     const id = editId || crypto.randomUUID()
-    const edit: AudioEdit = { id, type: 'amplify', startSample, endSample, gain: gainDb }
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'amplify', startSample, endSample, startTime: st, endTime: et, gain: gainDb }
     this.edits.push(edit)
     this.recomputeAndReload()
   }
@@ -852,7 +856,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     startTime: number,
     endTime: number,
     params: { threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number },
-  ): { id: string; startSample: number; endSample: number; threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number } | null {
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number } | null {
     if (!this.originalPcm) return null
 
     const startEdited = Math.floor(startTime * this.pcmSampleRate)
@@ -866,6 +870,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       type: 'limiter',
       startSample: startOriginal,
       endSample: endOriginal,
+      startTime,
+      endTime,
       threshold: params.threshold,
       makeupTarget: params.makeupTarget,
       kneeWidth: params.kneeWidth,
@@ -875,7 +881,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.edits.push(edit)
     this.recomputeAndReload()
 
-    return { id, startSample: startOriginal, endSample: endOriginal, ...params }
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, ...params }
   }
 
   /** Apply limiter to a region by original PCM sample coordinates (from peer). */
@@ -884,17 +890,89 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     endSample: number,
     params: { threshold: number; makeupTarget: number; kneeWidth: number; lookaheadMs: number; releaseMs: number },
     editId?: string,
+    startTime?: number,
+    endTime?: number,
   ) {
     const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
     const edit: AudioEdit = {
       id,
       type: 'limiter',
       startSample,
       endSample,
+      startTime: st,
+      endTime: et,
       threshold: params.threshold,
       makeupTarget: params.makeupTarget,
       kneeWidth: params.kneeWidth,
       lookaheadMs: params.lookaheadMs,
+      releaseMs: params.releaseMs,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Apply compressor to a region (local path — times in edited space). */
+  public compressorRegion(
+    startTime: number,
+    endTime: number,
+    params: { threshold: number; ratio: number; makeupGainDb: number; kneeWidth: number; lookaheadMs: number; attackMs: number; releaseMs: number },
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; threshold: number; ratio: number; makeupGainDb: number; kneeWidth: number; lookaheadMs: number; attackMs: number; releaseMs: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = {
+      id,
+      type: 'compressor',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime,
+      endTime,
+      threshold: params.threshold,
+      ratio: params.ratio,
+      makeupGainDb: params.makeupGainDb,
+      kneeWidth: params.kneeWidth,
+      lookaheadMs: params.lookaheadMs,
+      attackMs: params.attackMs,
+      releaseMs: params.releaseMs,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, ...params }
+  }
+
+  /** Apply compressor to a region by original PCM sample coordinates (from peer). */
+  public compressorRegionByOriginalSamples(
+    startSample: number,
+    endSample: number,
+    params: { threshold: number; ratio: number; makeupGainDb: number; kneeWidth: number; lookaheadMs: number; attackMs: number; releaseMs: number },
+    editId?: string,
+    startTime?: number,
+    endTime?: number,
+  ) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = {
+      id,
+      type: 'compressor',
+      startSample,
+      endSample,
+      startTime: st,
+      endTime: et,
+      threshold: params.threshold,
+      ratio: params.ratio,
+      makeupGainDb: params.makeupGainDb,
+      kneeWidth: params.kneeWidth,
+      lookaheadMs: params.lookaheadMs,
+      attackMs: params.attackMs,
       releaseMs: params.releaseMs,
     }
     this.edits.push(edit)
@@ -1097,6 +1175,91 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
           }
 
           // Pass 4: apply
+          for (let i = 0; i < regionLen; i++) {
+            const grLinear = Math.pow(10, gainReductionDb[i] / 20)
+            data[start + i] *= grLinear * makeupGainLinear
+          }
+        }
+      }
+    }
+
+    // Apply compressor edits
+    const compressorEdits = this.edits.filter((e) => e.type === 'compressor')
+    if (compressorEdits.length > 0) {
+      for (const edit of compressorEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+
+        const threshold = edit.threshold ?? -10
+        const ratio = edit.ratio ?? 4
+        const makeupGainDb = edit.makeupGainDb ?? 0
+        const kneeWidth = edit.kneeWidth ?? 5
+        const lookaheadMs = edit.lookaheadMs ?? 1
+        const attackMs = edit.attackMs ?? 30
+        const releaseMs = edit.releaseMs ?? 150
+        const halfKnee = kneeWidth / 2
+        const lookaheadSamples = Math.max(0, Math.round((lookaheadMs / 1000) * this.pcmSampleRate))
+        const attackCoeff = attackMs > 0 ? Math.exp(-1 / ((attackMs / 1000) * this.pcmSampleRate)) : 0
+        const releaseCoeff = releaseMs > 0 ? Math.exp(-1 / ((releaseMs / 1000) * this.pcmSampleRate)) : 0
+        const makeupGainLinear = Math.pow(10, makeupGainDb / 20)
+
+        for (let ch = 0; ch < result.length; ch++) {
+          const data = result[ch]
+          const regionLen = end - start
+          const gainReductionDb = new Float32Array(regionLen)
+
+          // Pass 1: compute per-sample gain reduction with ratio
+          for (let i = 0; i < regionLen; i++) {
+            const sample = Math.abs(data[start + i])
+            const inputDb = sample > 0 ? 20 * Math.log10(sample) : -120
+            let outputDb: number
+            if (inputDb <= threshold - halfKnee) {
+              // Below knee — no compression
+              outputDb = inputDb
+            } else if (inputDb >= threshold + halfKnee) {
+              // Above knee — compressed by ratio
+              outputDb = threshold + (inputDb - threshold) / ratio
+            } else {
+              // In the knee — smooth interpolation
+              const x = inputDb - threshold + halfKnee
+              const compressionAmount = (1 - 1 / ratio) * (x * x) / (2 * kneeWidth)
+              outputDb = inputDb - compressionAmount
+            }
+            gainReductionDb[i] = outputDb - inputDb
+          }
+
+          // Pass 2: lookahead
+          if (lookaheadSamples > 0) {
+            const smoothed = new Float32Array(regionLen)
+            for (let i = 0; i < regionLen; i++) {
+              let minGr = gainReductionDb[i]
+              const lookEnd = Math.min(regionLen, i + lookaheadSamples)
+              for (let j = i + 1; j < lookEnd; j++) {
+                if (gainReductionDb[j] < minGr) minGr = gainReductionDb[j]
+              }
+              smoothed[i] = minGr
+            }
+            gainReductionDb.set(smoothed)
+          }
+
+          // Pass 3: attack/release envelope
+          let envelopeDb = 0
+          for (let i = 0; i < regionLen; i++) {
+            const target = gainReductionDb[i]
+            if (target < envelopeDb) {
+              // Attack: smoothly increase gain reduction
+              envelopeDb = target + attackCoeff * (envelopeDb - target)
+            } else {
+              // Release: smoothly decrease gain reduction
+              envelopeDb = target + releaseCoeff * (envelopeDb - target)
+            }
+            gainReductionDb[i] = envelopeDb
+          }
+
+          // Pass 4: apply gain reduction + make-up gain
           for (let i = 0; i < regionLen; i++) {
             const grLinear = Math.pow(10, gainReductionDb[i] / 20)
             data[start + i] *= grLinear * makeupGainLinear
