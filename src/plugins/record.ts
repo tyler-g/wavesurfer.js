@@ -106,6 +106,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
    *  AudioTrack event listeners should check this to avoid creating spurious
    *  history entries (which would truncate the undo/redo stack). */
   public isReloading: boolean = false
+  /** Snapshot of wavesurfer's decodedData captured before recording starts.
+   *  Used by undo to restore the track to its pre-recording visual+audio state. */
+  private preRecordingData: { channelData: Float32Array[]; sampleRate: number } | null = null
 
   // Punch-in recording state
   private punchInSample: number | null = null
@@ -172,6 +175,19 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     if (this.wavesurfer) {
       this.originalOptions ??= {
         ...this.wavesurfer.options,
+      }
+
+      // Snapshot the current audio before the live waveform overwrites decodedData
+      if (!this.preRecordingData) {
+        const decoded = this.wavesurfer.getDecodedData()
+        if (decoded) {
+          const sampleRate = this.options.audioContext?.sampleRate || 44100
+          const channels: Float32Array[] = []
+          for (let i = 0; i < decoded.numberOfChannels; i++) {
+            channels.push(new Float32Array(decoded.getChannelData(i)))
+          }
+          this.preRecordingData = { channelData: channels, sampleRate }
+        }
       }
 
       this.wavesurfer.options.interact = false
@@ -611,8 +627,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
           const endTime = startTime + (finalPcm[0].length / sampleRate)
           this.emit('record-pcm-data' as any, { pcm: finalPcm, startTime, endTime })
 
-          const paddedWavBlob = this.padPCMToDuration(finalPcm, 60)
-          this.wavesurfer?.load(URL.createObjectURL(paddedWavBlob), undefined, 60)
+          const wavBlob = this.convertPCMToWAV(finalPcm)
+          this.wavesurfer?.loadBlob(wavBlob)
           return
         }
       }
@@ -770,6 +786,16 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
   public getOriginalPcm(): Float32Array[] | null {
     return this.originalPcm
+  }
+
+  /** Get the pre-recording audio snapshot (captured before live waveform overwrites it). */
+  public getPreRecordingData(): { channelData: Float32Array[]; sampleRate: number } | null {
+    return this.preRecordingData
+  }
+
+  /** Clear the pre-recording snapshot (called after history entry is created). */
+  public clearPreRecordingData(): void {
+    this.preRecordingData = null
   }
 
   public getSampleRate(): number {
