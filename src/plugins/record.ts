@@ -812,6 +812,13 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.edits = []
   }
 
+  /** Clear originalPcm and edits (e.g. when undoing the first recording on a track). */
+  public clearOriginalPcm() {
+    this.originalPcm = null
+    this.pcmSampleRate = 0
+    this.edits = []
+  }
+
   public importEdits(edits: AudioEdit[]) {
     this.edits = edits
     this.recomputeAndReload()
