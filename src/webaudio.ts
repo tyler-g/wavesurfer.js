@@ -23,6 +23,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   private playStartTime = 0
   private playedDuration = 0
   private _muted = false
+  private _volumeBeforeMute = 1
   private _playbackRate = 1
   private _duration: number | undefined = undefined
   private buffer: AudioBuffer | null = null
@@ -191,10 +192,15 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   }
 
   get volume() {
+    if (this._muted) return this._volumeBeforeMute
     return this.gainNode.gain.value
   }
   set volume(value) {
-    this.gainNode.gain.value = value
+    if (this._muted) {
+      this._volumeBeforeMute = value
+    } else {
+      this.gainNode.gain.value = value
+    }
     this.emit('volumechange')
   }
 
@@ -206,9 +212,10 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     this._muted = value
 
     if (this._muted) {
-      this.gainNode.disconnect()
+      this._volumeBeforeMute = this.gainNode.gain.value
+      this.gainNode.gain.value = 0
     } else {
-      this.gainNode.connect(this.outputNode)
+      this.gainNode.gain.value = this._volumeBeforeMute
     }
   }
 
@@ -223,10 +230,8 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
 
   /** Set a custom output node (e.g. StereoPannerNode) between the gain and destination. */
   public setOutputNode(node: AudioNode) {
-    if (!this._muted) {
-      this.gainNode.disconnect()
-      this.gainNode.connect(node)
-    }
+    this.gainNode.disconnect()
+    this.gainNode.connect(node)
     this.outputNode = node
   }
 
