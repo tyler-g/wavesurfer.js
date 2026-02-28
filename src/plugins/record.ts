@@ -1101,6 +1101,99 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return removed
   }
 
+  /**
+   * Insert PCM data into originalPcm at a given sample position (original-space).
+   * Shifts all existing edits whose startSample >= insertSample by the inserted length.
+   * Returns metadata for history.
+   */
+  public insertIntoOriginalPcm(
+    insertSample: number,
+    pcm: Float32Array[],
+  ): { id: string; insertSample: number; length: number } | null {
+    if (!this.originalPcm) return null
+
+    const id = crypto.randomUUID()
+    const insertLength = pcm[0].length
+    const origChannels = this.originalPcm.length
+    const insertChannels = pcm.length
+
+    // Build new originalPcm with inserted data
+    this.originalPcm = this.originalPcm.map((channel, ch) => {
+      // Handle channel count mismatch: duplicate mono to stereo, or take first channel
+      let insertData: Float32Array
+      if (ch < insertChannels) {
+        insertData = pcm[ch]
+      } else {
+        insertData = pcm[0] // duplicate first channel
+      }
+
+      const newBuf = new Float32Array(channel.length + insertLength)
+      // Clamp insertSample to valid range
+      const clampedInsert = Math.min(insertSample, channel.length)
+      newBuf.set(channel.subarray(0, clampedInsert), 0)
+      newBuf.set(insertData, clampedInsert)
+      newBuf.set(channel.subarray(clampedInsert), clampedInsert + insertLength)
+      return newBuf
+    })
+
+    // Shift existing edits past the insert point
+    for (const edit of this.edits) {
+      if (edit.startSample >= insertSample) {
+        edit.startSample += insertLength
+        edit.endSample += insertLength
+        edit.startTime = edit.startSample / this.pcmSampleRate
+        edit.endTime = edit.endSample / this.pcmSampleRate
+      } else if (edit.endSample > insertSample) {
+        // Edit spans the insert point — extend its end
+        edit.endSample += insertLength
+        edit.endTime = edit.endSample / this.pcmSampleRate
+      }
+    }
+
+    this.recomputeAndReload()
+    return { id, insertSample, length: insertLength }
+  }
+
+  /**
+   * Remove samples from originalPcm (inverse of insertIntoOriginalPcm for undo).
+   * Un-shifts existing edits that were shifted during insert.
+   */
+  public removeFromOriginalPcm(startSample: number, length: number) {
+    if (!this.originalPcm) return
+
+    this.originalPcm = this.originalPcm.map((channel) => {
+      const clampedStart = Math.min(startSample, channel.length)
+      const clampedEnd = Math.min(clampedStart + length, channel.length)
+      const newBuf = new Float32Array(channel.length - (clampedEnd - clampedStart))
+      newBuf.set(channel.subarray(0, clampedStart), 0)
+      newBuf.set(channel.subarray(clampedEnd), clampedStart)
+      return newBuf
+    })
+
+    // Un-shift existing edits
+    for (const edit of this.edits) {
+      if (edit.startSample >= startSample + length) {
+        edit.startSample -= length
+        edit.endSample -= length
+        edit.startTime = edit.startSample / this.pcmSampleRate
+        edit.endTime = edit.endSample / this.pcmSampleRate
+      } else if (edit.startSample >= startSample) {
+        // Edit was inside the removed range — this shouldn't normally happen
+        // during undo, but handle gracefully
+        edit.startSample = startSample
+        edit.endSample = Math.max(startSample, edit.endSample - length)
+        edit.startTime = edit.startSample / this.pcmSampleRate
+        edit.endTime = edit.endSample / this.pcmSampleRate
+      } else if (edit.endSample > startSample) {
+        // Edit spans the removal point — shrink its end
+        edit.endSample = Math.max(edit.startSample, edit.endSample - length)
+        edit.endTime = edit.endSample / this.pcmSampleRate
+      }
+    }
+
+    this.recomputeAndReload()
+  }
+
   public recomputeAndReload() {
     if (!this.originalPcm || !this.wavesurfer) return
 
@@ -1130,7 +1223,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     }
   }
 
-  private editedToOriginal(editedSample: number): number {
+  public editedToOriginal(editedSample: number): number {
     const ranges = this.mergeOverlappingRanges()
     let offset = 0
 
