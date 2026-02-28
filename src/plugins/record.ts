@@ -70,6 +70,9 @@ type AudioEdit = {
   ratio?: number
   makeupGainDb?: number
   attackMs?: number
+  // Change Pitch params
+  semitones?: number
+  highQuality?: boolean
 }
 
 type SampleRange = {
@@ -1029,6 +1032,66 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
+  /** Change pitch of a region (local path — times in edited space). */
+  public changePitchRegion(
+    startTime: number,
+    endTime: number,
+    semitones: number,
+    highQuality?: boolean,
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; semitones: number; highQuality: boolean } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const hq = highQuality ?? false
+    const edit: AudioEdit = {
+      id,
+      type: 'changePitch',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime,
+      endTime,
+      semitones,
+      highQuality: hq,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, semitones, highQuality: hq }
+  }
+
+  /** Change pitch of a region by original PCM sample coordinates (from peer). */
+  public changePitchRegionByOriginalSamples(
+    startSample: number,
+    endSample: number,
+    semitones: number,
+    highQuality?: boolean,
+    editId?: string,
+    startTime?: number,
+    endTime?: number,
+  ) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const hq = highQuality ?? false
+    const edit: AudioEdit = {
+      id,
+      type: 'changePitch',
+      startSample,
+      endSample,
+      startTime: st,
+      endTime: et,
+      semitones,
+      highQuality: hq,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
   /** Restore (undo) an edit by its ID. Returns the removed edit data or null. */
   public restoreEdit(editId: string): AudioEdit | null {
     const idx = this.edits.findIndex((e) => e.id === editId)
@@ -1314,6 +1377,182 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
             const grLinear = Math.pow(10, gainReductionDb[i] / 20)
             data[start + i] *= grLinear * makeupGainLinear
           }
+        }
+      }
+    }
+
+    // Apply changePitch edits — resample then WSOLA time-stretch
+    const changePitchEdits = this.edits.filter((e) => e.type === 'changePitch')
+    if (changePitchEdits.length > 0) {
+      for (const edit of changePitchEdits) {
+        const semitones = edit.semitones ?? 0
+        if (semitones === 0) continue
+
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        const regionLen = end - start
+        if (regionLen <= 0) continue
+
+        const ratio = Math.pow(2, semitones / 12)
+        const highQuality = edit.highQuality ?? false
+
+        // WSOLA parameters (based on SoundTouch defaults, scaled to sample rate)
+        const sr = this.pcmSampleRate
+        const seqLenSamples = Math.round((highQuality ? 0.082 : 0.060) * sr)  // sequence length
+        const seekWindowSamples = Math.round((highQuality ? 0.028 : 0.015) * sr) // seek tolerance
+        const overlapSamples = Math.round((highQuality ? 0.012 : 0.008) * sr) // crossfade length
+
+        for (let ch = 0; ch < result.length; ch++) {
+          const data = result[ch]
+          // Copy the region (we need an independent copy since we'll overwrite data)
+          const region = new Float32Array(regionLen)
+          region.set(data.subarray(start, end))
+
+          // Step 1: Resample by 1/ratio — shifts pitch AND changes duration
+          // Pitch UP (ratio>1): read faster → shorter. Pitch DOWN (ratio<1): read slower → longer
+          const resampledLen = Math.max(1, Math.round(regionLen / ratio))
+          const resampled = new Float32Array(resampledLen)
+          for (let i = 0; i < resampledLen; i++) {
+            const srcPos = i * ratio
+            const srcIdx = Math.floor(srcPos)
+            const frac = srcPos - srcIdx
+            const s0 = srcIdx < regionLen ? region[srcIdx] : 0
+            const s1 = srcIdx + 1 < regionLen ? region[srcIdx + 1] : 0
+            resampled[i] = s0 + frac * (s1 - s0)
+          }
+
+          // Step 2: WSOLA time-stretch resampled back to regionLen
+          // stretchFactor > 1 means stretching (pitch up), < 1 means compressing (pitch down)
+          const stretchFactor = regionLen / resampledLen  // = ratio
+
+          // Clamp parameters for very short regions
+          const seqLen = Math.min(seqLenSamples, Math.floor(resampledLen / 2), Math.floor(regionLen / 2))
+          if (seqLen < 4) {
+            // Region too short for WSOLA — fall back to direct copy/truncate
+            for (let i = 0; i < regionLen; i++) {
+              data[start + i] = i < resampledLen ? resampled[i] : 0
+            }
+            continue
+          }
+          const seekWin = Math.min(seekWindowSamples, Math.floor(seqLen / 2))
+          const overlap = Math.min(overlapSamples, Math.floor(seqLen / 2))
+
+          // Synthesis hop (fixed, determines output spacing)
+          const Hs = seqLen - overlap
+          // Analysis hop (nominal, determines input spacing)
+          const Ha = Math.max(1, Math.round(Hs / stretchFactor))
+
+          const output = new Float32Array(regionLen)
+
+          // Normalized cross-correlation over the overlap region
+          // Returns the best offset in [-seekWin, +seekWin]
+          const findBestOffset = (nominalPos: number, prevTail: Float32Array): number => {
+            let bestCorr = -Infinity
+            let bestDelta = 0
+
+            for (let delta = -seekWin; delta <= seekWin; delta++) {
+              const candidatePos = nominalPos + delta
+              if (candidatePos < 0 || candidatePos + overlap > resampledLen) continue
+
+              let cross = 0
+              let energy = 0
+              for (let i = 0; i < overlap; i++) {
+                cross += prevTail[i] * resampled[candidatePos + i]
+                energy += resampled[candidatePos + i] * resampled[candidatePos + i]
+              }
+
+              // Normalized correlation with mid-range bias (SoundTouch heuristic)
+              const norm = energy > 1e-10 ? cross / Math.sqrt(energy) : 0
+              // Bias toward center of search window to avoid large jumps
+              const dist = delta / (seekWin || 1)
+              const biased = norm * (1.0 - 0.25 * dist * dist)
+
+              if (biased > bestCorr) {
+                bestCorr = biased
+                bestDelta = delta
+              }
+            }
+            return bestDelta
+          }
+
+          // Linear crossfade: blend prevTail and new segment head
+          const crossfade = (
+            dst: Float32Array, dstOffset: number,
+            fadeOut: Float32Array, fadeIn: Float32Array,
+            len: number
+          ) => {
+            for (let i = 0; i < len; i++) {
+              const w = i / len
+              const idx = dstOffset + i
+              if (idx >= 0 && idx < regionLen) {
+                dst[idx] = fadeOut[i] * (1 - w) + fadeIn[i] * w
+              }
+            }
+          }
+
+          let inPos = 0       // current position in resampled buffer
+          let outPos = 0       // current position in output buffer
+          let prevDelta = 0    // offset applied to previous frame
+
+          // Process first frame (no crossfade needed)
+          const firstLen = Math.min(seqLen, resampledLen, regionLen)
+          for (let i = 0; i < firstLen; i++) {
+            output[i] = resampled[i]
+          }
+          outPos = Hs
+          inPos = Ha
+
+          // Save tail of first frame for next crossfade
+          let prevTail = new Float32Array(overlap)
+          const firstTailStart = Math.max(0, firstLen - overlap)
+          for (let i = 0; i < overlap; i++) {
+            prevTail[i] = firstTailStart + i < firstLen ? resampled[firstTailStart + i] : 0
+          }
+
+          // Main WSOLA loop
+          while (outPos < regionLen && inPos < resampledLen) {
+            // Nominal analysis position, adjusted by previous delta
+            const nominalPos = inPos
+
+            // Find best-aligned position via cross-correlation
+            const delta = findBestOffset(nominalPos, prevTail)
+            const actualPos = Math.max(0, Math.min(resampledLen - seqLen, nominalPos + delta))
+
+            // Crossfade: blend prevTail with head of new segment
+            const fadeIn = new Float32Array(overlap)
+            for (let i = 0; i < overlap; i++) {
+              fadeIn[i] = actualPos + i < resampledLen ? resampled[actualPos + i] : 0
+            }
+            crossfade(output, outPos, prevTail, fadeIn, overlap)
+
+            // Copy the non-overlapping body of the segment
+            const bodyStart = outPos + overlap
+            const bodyLen = Math.min(seqLen - overlap, regionLen - bodyStart)
+            for (let i = 0; i < bodyLen; i++) {
+              const srcIdx = actualPos + overlap + i
+              const dstIdx = bodyStart + i
+              if (dstIdx < regionLen) {
+                output[dstIdx] = srcIdx < resampledLen ? resampled[srcIdx] : 0
+              }
+            }
+
+            // Save tail for next iteration's crossfade
+            const tailStart = actualPos + seqLen - overlap
+            prevTail = new Float32Array(overlap)
+            for (let i = 0; i < overlap; i++) {
+              prevTail[i] = tailStart + i < resampledLen ? resampled[tailStart + i] : 0
+            }
+
+            prevDelta = delta
+            outPos += Hs
+            inPos += Ha
+          }
+
+          // Replace the region in the result buffer
+          data.set(output, start)
         }
       }
     }
