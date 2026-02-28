@@ -1101,6 +1101,77 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return removed
   }
 
+  /** Restore multiple edits at once (single recompute). Returns removed edits. */
+  public restoreEdits(editIds: string[]): AudioEdit[] {
+    const removed: AudioEdit[] = []
+    for (const editId of editIds) {
+      const idx = this.edits.findIndex((e) => e.id === editId)
+      if (idx !== -1) {
+        removed.push(...this.edits.splice(idx, 1))
+      }
+    }
+    if (removed.length > 0) {
+      this.recomputeAndReload()
+    }
+    return removed
+  }
+
+  /** Trim: keep only the selected region, delete everything before and after (local path). */
+  public trimRegion(startTime: number, endTime: number): {
+    editIds: string[]
+    startSample: number
+    endSample: number
+    startTime: number
+    endTime: number
+    deleteEdits: { id: string; startSample: number; endSample: number; startTime: number; endTime: number }[]
+  } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+    const totalLength = this.originalPcm[0].length
+
+    const deleteEdits: { id: string; startSample: number; endSample: number; startTime: number; endTime: number }[] = []
+    const editIds: string[] = []
+
+    // Delete everything before the selection
+    if (startOriginal > 0) {
+      const id = crypto.randomUUID()
+      const edit: AudioEdit = { id, type: 'delete', startSample: 0, endSample: startOriginal, startTime: 0, endTime: startTime }
+      this.edits.push(edit)
+      editIds.push(id)
+      deleteEdits.push({ id, startSample: 0, endSample: startOriginal, startTime: 0, endTime: startTime })
+    }
+
+    // Delete everything after the selection
+    if (endOriginal < totalLength) {
+      const id = crypto.randomUUID()
+      const edit: AudioEdit = { id, type: 'delete', startSample: endOriginal, endSample: totalLength, startTime: endTime, endTime: totalLength / this.pcmSampleRate }
+      this.edits.push(edit)
+      editIds.push(id)
+      deleteEdits.push({ id, startSample: endOriginal, endSample: totalLength, startTime: endTime, endTime: totalLength / this.pcmSampleRate })
+    }
+
+    if (editIds.length === 0) return null // selection already covers everything
+
+    this.recomputeAndReload()
+
+    return { editIds, startSample: startOriginal, endSample: endOriginal, startTime, endTime, deleteEdits }
+  }
+
+  /** Trim by original PCM sample coordinates (from peer). */
+  public trimRegionByOriginalSamples(
+    deleteEdits: { id: string; startSample: number; endSample: number; startTime: number; endTime: number }[],
+  ) {
+    for (const de of deleteEdits) {
+      const edit: AudioEdit = { id: de.id, type: 'delete', startSample: de.startSample, endSample: de.endSample, startTime: de.startTime, endTime: de.endTime }
+      this.edits.push(edit)
+    }
+    this.recomputeAndReload()
+  }
+
   /**
    * Insert PCM data into originalPcm at a given sample position (original-space).
    * Shifts all existing edits whose startSample >= insertSample by the inserted length.
