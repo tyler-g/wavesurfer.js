@@ -658,6 +658,14 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     this.emit('timeupdate', time)
   }
 
+  /** Update visual progress without changing audio position. Used for master timeline sync. */
+  public setProgress(time: number, skipScroll?: boolean) {
+    const duration = this.getDuration()
+    if (duration > 0) {
+      this.renderer.renderProgress(time / duration, this.isPlaying(), skipScroll)
+    }
+  }
+
   /** Seek to a ratio of audio as [0..1] (0 = beginning, 1 = end) */
   public seekTo(progress: number) {
     const time = this.getDuration() * progress
@@ -680,6 +688,22 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
 
     return playResult
+  }
+
+  /** Start playback synchronized to a shared AudioContext time snapshot.
+   *  Timer is started by the 'play' event handler in initPlayerEvents. */
+  public playAt(when: number): void {
+    if (this.media instanceof WebAudioPlayer) {
+      ;(this.media as unknown as WebAudioPlayer).playAt(when)
+    }
+  }
+
+  /** Pause playback synchronized to a shared AudioContext time snapshot.
+   *  Timer is stopped by the 'pause' event handler in initPlayerEvents. */
+  public pauseAt(when: number): void {
+    if (this.media instanceof WebAudioPlayer) {
+      ;(this.media as unknown as WebAudioPlayer).pauseAt(when)
+    }
   }
 
   /** Play or pause the audio */

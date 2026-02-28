@@ -118,6 +118,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   // Channel count for PCM data (set before recording for stereo tracks)
   private recordingChannels: number = 1
 
+  // PCM chunks accumulated during recording (pushed from external PCM pipeline)
+  private recordedChunksPCM: Float32Array[] = []
+  // Generation counter to detect stale onstop handlers from previous recordings
+  private recordingGeneration: number = 0
+
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
     super({
@@ -155,6 +160,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   /** Set the number of channels for the PCM recording pipeline (default 1 = mono) */
   public setRecordingChannels(channels: number) {
     this.recordingChannels = channels
+  }
+
+  /** Push a PCM chunk from the external audio pipeline (called by MasterSlice). */
+  public pushPcmChunk(chunk: Float32Array) {
+    this.recordedChunksPCM.push(chunk)
   }
 
   public renderMicStream(stream: MediaStream): MicStream {
@@ -305,8 +315,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const cleanup = () => {
       clearInterval(intervalId)
 
-      source?.disconnect()
-      analyser?.disconnect()
+      try { source?.disconnect() } catch (_) { /* already disconnected */ }
+      try { analyser?.disconnect() } catch (_) { /* already disconnected */ }
 
       // if the audio context was passed, don't close it
       if (!this.options.audioContext) {
@@ -567,6 +577,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
     this.source = micStream.source
 
+    // Reset PCM chunks for the new recording
+    this.recordedChunksPCM = []
+    const generation = ++this.recordingGeneration
+
     this.dataWindow = null
     const mediaRecorder =
       this.mediaRecorder ||
@@ -578,75 +592,23 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.stopRecording()
 
     const recordedChunks: BlobPart[] = [] // this is the mediaRecorder data (COMPRESSED)
-    const recordedChunksPCM: Float32Array[] = [] // this is the raw PCM data (UNCOMPRESSED) Only available with workerContext and pcm passthrough
-
 
     mediaRecorder.ondataavailable = (event) => {
-      //console.log('mediaRecorder.ondataavailable', event.data);
       if (event.data.size > 0) {
         recordedChunks.push(event.data)
       }
       this.emit('record-data-available', event.data)
     }
 
-    if (this.options.workerContext) {
-      this.options.workerContext.onmessage = async (e) => {
-        if (!e.data) return
-        // received a raw audio chunk from the stream
-        if (e.data.cmd === 'passthrough') {
-          // console.log('record plugin received pcm', e.data.pcm)
-          recordedChunksPCM.push(e.data.pcm)
-          return
-        }
-        if (e.data.cmd === 'passthrough-uint8') {
-          //console.log('record plugin received pcm as uint8', e.data.pcm)
-          return
-        }
-        if (e.data.cmd === 'pcm-data') {
-          console.log('record plugin | received pcm data', e.data.pcm)
-
-          let finalPcm: Float32Array[] = e.data.pcm
-
-          // Capture timing info before punch-in state is reset
-          const startTime = this.punchInTimeSec
-          const sampleRate = this.options.audioContext?.sampleRate || 44100
-
-          // If punch-in was set, stitch the new recording with existing audio
-          if (this.punchInSample !== null) {
-            finalPcm = this.stitchPunchIn(e.data.pcm)
-            this.punchInSample = null
-            this.punchInTimeSec = 0
-            this.existingAudioForPunchIn = null
-          }
-
-          // Store the original PCM internally for non-destructive editing
-          this.originalPcm = finalPcm
-          this.pcmSampleRate = sampleRate
-          this.edits = []
-
-          const endTime = startTime + (finalPcm[0].length / sampleRate)
-          this.emit('record-pcm-data' as any, { pcm: finalPcm, startTime, endTime })
-
-          const wavBlob = this.convertPCMToWAV(finalPcm)
-          this.wavesurfer?.loadBlob(wavBlob)
-          return
-        }
-      }
-    }
     const emitWithBlob = (ev: 'record-pause' | 'record-end') => {
+      // Skip if a new recording has started (stale onstop from previous recording)
+      if (generation !== this.recordingGeneration) return
+
       const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType })
-      //this.forceDownload(blob, 'pcmFromMediaRecorder.wav')
       this.emit(ev, blob)
       if (this.options.renderRecordedAudio) {
         this.applyOriginalOptionsIfNeeded()
-        //console.log('tester recordedChunks', recordedChunks)
-        this.options.workerContext?.postMessage({
-          cmd: 'merge-pcm',
-          buf: recordedChunksPCM,
-          channels: this.recordingChannels,
-        })
-        //this.wavesurfer?.load(URL.createObjectURL(blob), undefined, 60)
-        //this.wavesurfer?.load(URL.createObjectURL(blob))
+        this.processPcmData()
       }
     }
 
@@ -738,6 +700,61 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     } else {
       this.existingAudioForPunchIn = null
     }
+  }
+
+  /** Merge accumulated PCM chunks into per-channel Float32Arrays, de-interleaving stereo if needed. */
+  private mergePcmChunks(): Float32Array[] {
+    const totalLength = this.recordedChunksPCM.reduce((sum, arr) => sum + arr.length, 0)
+    const merged = new Float32Array(totalLength)
+    let offset = 0
+    for (const chunk of this.recordedChunksPCM) {
+      merged.set(chunk, offset)
+      offset += chunk.length
+    }
+
+    const channels = this.recordingChannels
+    if (channels > 1) {
+      const frameCount = Math.floor(merged.length / channels)
+      const result: Float32Array[] = []
+      for (let ch = 0; ch < channels; ch++) {
+        result.push(new Float32Array(frameCount))
+      }
+      for (let i = 0; i < frameCount; i++) {
+        for (let ch = 0; ch < channels; ch++) {
+          result[ch][i] = merged[i * channels + ch]
+        }
+      }
+      return result
+    }
+
+    return [merged]
+  }
+
+  /** Process accumulated PCM data after recording stops: merge, stitch punch-in, store, and reload waveform. */
+  private processPcmData() {
+    if (this.recordedChunksPCM.length === 0) return
+
+    let finalPcm = this.mergePcmChunks()
+
+    const startTime = this.punchInTimeSec
+    const sampleRate = this.options.audioContext?.sampleRate || 44100
+
+    if (this.punchInSample !== null) {
+      finalPcm = this.stitchPunchIn(finalPcm)
+      this.punchInSample = null
+      this.punchInTimeSec = 0
+      this.existingAudioForPunchIn = null
+    }
+
+    this.originalPcm = finalPcm
+    this.pcmSampleRate = sampleRate
+    this.edits = []
+
+    const endTime = startTime + (finalPcm[0].length / sampleRate)
+    this.emit('record-pcm-data' as any, { pcm: finalPcm, startTime, endTime })
+
+    const wavBlob = this.convertPCMToWAV(finalPcm)
+    this.wavesurfer?.loadBlob(wavBlob)
   }
 
   private stitchPunchIn(newPcm: Float32Array[]): Float32Array[] {

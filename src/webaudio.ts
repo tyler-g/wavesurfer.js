@@ -129,9 +129,50 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     this.emit('play')
   }
 
+  /** Start playback synchronized to a specific AudioContext time. */
+  playAt(when: number) {
+    if (!this.paused) return
+    this.paused = false
+
+    this.bufferNode?.disconnect()
+    this.bufferNode = this.audioContext.createBufferSource()
+    if (this.buffer) {
+      this.bufferNode.buffer = this.buffer
+    }
+    this.bufferNode.playbackRate.value = this._playbackRate
+    this.bufferNode.connect(this.gainNode)
+
+    let currentPos = this.playedDuration * this._playbackRate
+    if (currentPos >= this.duration || currentPos < 0) {
+      currentPos = 0
+      this.playedDuration = 0
+    }
+
+    this.bufferNode.start(when, currentPos)
+    this.playStartTime = when
+
+    this.bufferNode.onended = () => {
+      if (this.currentTime >= this.duration) {
+        this.pause()
+        this.emit('ended')
+      }
+    }
+
+    this.emit('play')
+  }
+
   pause() {
     if (this.paused) return
     this._pause()
+    this.emit('pause')
+  }
+
+  /** Pause playback synchronized to a specific AudioContext time. */
+  pauseAt(when: number) {
+    if (this.paused) return
+    this.paused = true
+    this.bufferNode?.stop()
+    this.playedDuration += when - this.playStartTime
     this.emit('pause')
   }
 
