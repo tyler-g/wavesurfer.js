@@ -44,6 +44,10 @@ export type RecordPluginEvents = BasePluginEvents & {
   'record-progress': [duration: number]
   /** On every new recorded chunk */
   'record-data-available': [blob: Blob]
+  /** Fires when audio effect processing begins (recomputeAndReload starts) */
+  'processing-start': []
+  /** Fires when audio effect processing completes (recomputeAndReload finishes) */
+  'processing-end': []
 }
 
 type MicStream = {
@@ -738,6 +742,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     if (this.recordedChunksPCM.length === 0) return
 
     let finalPcm = this.mergePcmChunks()
+    this.recordedChunksPCM = []
 
     const startTime = this.punchInTimeSec
     const sampleRate = this.options.audioContext?.sampleRate || 44100
@@ -1268,6 +1273,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   public recomputeAndReload() {
     if (!this.originalPcm || !this.wavesurfer) return
 
+    this.emit('processing-start' as any)
+
     const effectivePcm = this.computeEffectiveAudio()
     if (effectivePcm[0].length > 0) {
       // Preserve cursor position, zoom, and scroll across reload
@@ -1280,6 +1287,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.wavesurfer.loadBlob(wavBlob).then(() => {
         if (!this.wavesurfer) {
           this.isReloading = false
+          this.emit('processing-end' as any)
           return
         }
         if (minPxPerSec) {
@@ -1288,9 +1296,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         this.wavesurfer.setTime(currentTime)
         this.wavesurfer.setScroll(scrollLeft)
         this.isReloading = false
+        this.emit('processing-end' as any)
       })
     } else {
       this.wavesurfer.empty()
+      this.emit('processing-end' as any)
     }
   }
 
