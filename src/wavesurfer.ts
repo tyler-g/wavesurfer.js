@@ -596,6 +596,41 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
   }
 
+  /** Load audio directly from PCM Float32Arrays, bypassing the WAV blob pipeline.
+   *  Creates a real AudioBuffer via audioContext.createBuffer() — single copy, no transient blobs. */
+  public async loadPcm(channelData: Float32Array[], sampleRate: number): Promise<void> {
+    this.abortController?.abort()
+    this.abortController = null
+
+    if (!this.options.media && this.isPlaying()) this.pause()
+
+    this.decodedData = null
+    this.stopAtPosition = null
+
+    const numChannels = channelData.length
+    const length = channelData[0]?.length || 0
+    if (numChannels === 0 || length === 0) return
+
+    const media = this.getMediaElement()
+    if (!(media instanceof WebAudioPlayer)) {
+      throw new Error('loadPcm requires WebAudio backend')
+    }
+
+    const audioContext = (media as unknown as WebAudioPlayer).getAudioContext()
+    const audioBuffer = audioContext.createBuffer(numChannels, length, sampleRate)
+    for (let ch = 0; ch < numChannels; ch++) {
+      audioBuffer.copyToChannel(channelData[ch], ch)
+    }
+
+    ;(media as unknown as WebAudioPlayer).setAudioBuffer(audioBuffer)
+
+    this.decodedData = audioBuffer
+    this.renderer.render(this.decodedData)
+
+    this.emit('decode', this.getDuration())
+    this.emit('ready', this.getDuration())
+  }
+
   /** Zoom the waveform by a given pixels-per-second factor */
   public zoom(minPxPerSec: number) {
     if (!this.decodedData) {

@@ -77,6 +77,10 @@ type AudioEdit = {
   // Change Pitch params
   semitones?: number
   highQuality?: boolean
+  // Fade In / Fade Out params
+  curve?: 'linear' | 'exponential'
+  // Normalize params
+  targetDb?: number
 }
 
 type SampleRange = {
@@ -741,17 +745,36 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private processPcmData() {
     if (this.recordedChunksPCM.length === 0) return
 
-    let finalPcm = this.mergePcmChunks()
+    const rawRecordedPcm = this.mergePcmChunks()
     this.recordedChunksPCM = []
+
+    const hadEdits = this.edits.length > 0
+    const wasFirstRecording = !this.originalPcm && !this.existingAudioForPunchIn
+    const punchInSample = this.punchInSample ?? 0
+
+    // Extract overwritten segment (what the recording replaces)
+    let overwrittenPcm: Float32Array[] | null = null
+    if (this.existingAudioForPunchIn) {
+      const recLen = rawRecordedPcm[0].length
+      overwrittenPcm = this.existingAudioForPunchIn.map((ch) => {
+        const start = Math.min(punchInSample, ch.length)
+        const end = Math.min(punchInSample + recLen, ch.length)
+        return end > start ? ch.slice(start, end) : new Float32Array(0)
+      })
+    }
+    const overwrittenLength = overwrittenPcm?.[0]?.length ?? 0
 
     const startTime = this.punchInTimeSec
     const sampleRate = this.options.audioContext?.sampleRate || 44100
 
+    let finalPcm: Float32Array[]
     if (this.punchInSample !== null) {
-      finalPcm = this.stitchPunchIn(finalPcm)
+      finalPcm = this.stitchPunchIn(rawRecordedPcm)
       this.punchInSample = null
       this.punchInTimeSec = 0
       this.existingAudioForPunchIn = null
+    } else {
+      finalPcm = rawRecordedPcm
     }
 
     this.originalPcm = finalPcm
@@ -759,10 +782,106 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.edits = []
 
     const endTime = startTime + (finalPcm[0].length / sampleRate)
-    this.emit('record-pcm-data' as any, { pcm: finalPcm, startTime, endTime })
+    this.emit('record-pcm-data' as any, {
+      pcm: finalPcm, startTime, endTime,
+      recordedPcm: rawRecordedPcm, punchInSample,
+      overwrittenPcm, overwrittenLength,
+      wasFirstRecording, hadEdits,
+    })
 
-    const wavBlob = this.convertPCMToWAV(finalPcm)
-    this.wavesurfer?.loadBlob(wavBlob)
+    this.wavesurfer?.loadPcm(finalPcm, sampleRate)
+  }
+
+  /** Undo a recording by unsplicing the recorded delta from originalPcm. */
+  public undoRecording(opts: {
+    recordedPcm: Float32Array[]
+    punchInSample: number
+    overwrittenPcm: Float32Array[] | null
+    overwrittenLength: number
+    wasFirstRecording: boolean
+  }) {
+    if (opts.wasFirstRecording) {
+      this.originalPcm = null
+      this.pcmSampleRate = 0
+      this.edits = []
+      if (this.wavesurfer) {
+        this.wavesurfer.clear()
+      }
+      return
+    }
+
+    if (!this.originalPcm) return
+
+    const { recordedPcm, punchInSample, overwrittenPcm, overwrittenLength } = opts
+    const recLen = recordedPcm[0].length
+
+    // Unsplice: remove the recorded segment and re-insert overwritten data
+    this.originalPcm = this.originalPcm.map((channel, ch) => {
+      const overwrittenCh = overwrittenPcm?.[ch] ?? null
+      const overLen = overwrittenCh?.length ?? 0
+      // Before the punch-in: keep as-is
+      const pre = channel.subarray(0, punchInSample)
+      // After the recorded segment: everything past punchIn + recLen
+      const postStart = punchInSample + recLen
+      const post = postStart < channel.length ? channel.subarray(postStart) : new Float32Array(0)
+      // Build new buffer: pre + overwritten + post
+      const newLen = punchInSample + overLen + post.length
+      const result = new Float32Array(newLen)
+      result.set(pre, 0)
+      if (overwrittenCh && overLen > 0) {
+        result.set(overwrittenCh, punchInSample)
+      }
+      result.set(post, punchInSample + overLen)
+      return result
+    })
+
+    this.edits = []
+    this.recomputeAndReload()
+  }
+
+  /** Redo a recording by re-splicing the recorded delta into originalPcm. */
+  public redoRecording(opts: {
+    recordedPcm: Float32Array[]
+    punchInSample: number
+    overwrittenLength: number
+    wasFirstRecording: boolean
+  }) {
+    const { recordedPcm, punchInSample, overwrittenLength, wasFirstRecording } = opts
+    const sampleRate = this.pcmSampleRate || this.options.audioContext?.sampleRate || 44100
+
+    if (wasFirstRecording) {
+      this.originalPcm = recordedPcm.map((ch) => new Float32Array(ch))
+      this.pcmSampleRate = sampleRate
+      this.edits = []
+      // Use loadPcm directly instead of recomputeAndReload — no edits to apply,
+      // and the wavesurfer may not be fully rendered yet (e.g. track just re-created
+      // via addTrack redo), which causes recomputeAndReload's zoom() to throw.
+      this.wavesurfer?.loadPcm(this.originalPcm, sampleRate)
+      return
+    }
+
+    if (!this.originalPcm) return
+
+    const recLen = recordedPcm[0].length
+
+    // Splice: replace overwrittenLength samples at punchInSample with recordedPcm
+    this.originalPcm = this.originalPcm.map((channel, ch) => {
+      const recCh = ch < recordedPcm.length ? recordedPcm[ch] : recordedPcm[0]
+      const pre = channel.subarray(0, punchInSample)
+      const postStart = punchInSample + overwrittenLength
+      const post = postStart < channel.length ? channel.subarray(postStart) : new Float32Array(0)
+      const newLen = punchInSample + recLen + post.length
+      const result = new Float32Array(newLen)
+      result.set(pre, 0)
+      result.set(recCh, punchInSample)
+      result.set(post, punchInSample + recLen)
+      return result
+    })
+
+    this.edits = []
+    // Use loadPcm directly — edits are cleared so computeEffectiveAudio is a no-op copy,
+    // and the wavesurfer may not support zoom() yet if the track was just re-created.
+    this.wavesurfer?.loadPcm(this.originalPcm, sampleRate)
   }
 
   private stitchPunchIn(newPcm: Float32Array[]): Float32Array[] {
@@ -1097,6 +1216,129 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
+  /** Reverse a region (local path — times in edited space). */
+  public reverseRegion(
+    startTime: number,
+    endTime: number,
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'reverse', startSample: startOriginal, endSample: endOriginal, startTime, endTime }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime }
+  }
+
+  /** Reverse a region by original PCM sample coordinates (from peer). */
+  public reverseRegionByOriginalSamples(startSample: number, endSample: number, editId?: string, startTime?: number, endTime?: number) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'reverse', startSample, endSample, startTime: st, endTime: et }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Apply fade-in to a region (local path — times in edited space). */
+  public fadeInRegion(
+    startTime: number,
+    endTime: number,
+    curve: 'linear' | 'exponential' = 'linear',
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; curve: string } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'fadeIn', startSample: startOriginal, endSample: endOriginal, startTime, endTime, curve }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, curve }
+  }
+
+  /** Apply fade-in to a region by original PCM sample coordinates (from peer). */
+  public fadeInRegionByOriginalSamples(startSample: number, endSample: number, curve: 'linear' | 'exponential', editId?: string, startTime?: number, endTime?: number) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'fadeIn', startSample, endSample, startTime: st, endTime: et, curve }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Apply fade-out to a region (local path — times in edited space). */
+  public fadeOutRegion(
+    startTime: number,
+    endTime: number,
+    curve: 'linear' | 'exponential' = 'linear',
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; curve: string } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'fadeOut', startSample: startOriginal, endSample: endOriginal, startTime, endTime, curve }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, curve }
+  }
+
+  /** Apply fade-out to a region by original PCM sample coordinates (from peer). */
+  public fadeOutRegionByOriginalSamples(startSample: number, endSample: number, curve: 'linear' | 'exponential', editId?: string, startTime?: number, endTime?: number) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'fadeOut', startSample, endSample, startTime: st, endTime: et, curve }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Normalize a region (local path — times in edited space). */
+  public normalizeRegion(
+    startTime: number,
+    endTime: number,
+    targetDb: number = -0.1,
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; targetDb: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = { id, type: 'normalize', startSample: startOriginal, endSample: endOriginal, startTime, endTime, targetDb }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, targetDb }
+  }
+
+  /** Normalize a region by original PCM sample coordinates (from peer). */
+  public normalizeRegionByOriginalSamples(startSample: number, endSample: number, targetDb: number, editId?: string, startTime?: number, endTime?: number) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = { id, type: 'normalize', startSample, endSample, startTime: st, endTime: et, targetDb }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
   /** Restore (undo) an edit by its ID. Returns the removed edit data or null. */
   public restoreEdit(editId: string): AudioEdit | null {
     const idx = this.edits.findIndex((e) => e.id === editId)
@@ -1282,9 +1524,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       const scrollLeft = this.wavesurfer.getScroll()
       const minPxPerSec = this.wavesurfer.options.minPxPerSec || 0
 
-      const wavBlob = this.convertPCMToWAV(effectivePcm)
+      const sampleRate = this.pcmSampleRate || this.options.audioContext?.sampleRate || 44100
       this.isReloading = true
-      this.wavesurfer.loadBlob(wavBlob).then(() => {
+      this.wavesurfer.loadPcm(effectivePcm, sampleRate).then(() => {
         if (!this.wavesurfer) {
           this.isReloading = false
           this.emit('processing-end' as any)
@@ -1727,6 +1969,101 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
           // Replace the region in the result buffer
           data.set(output, start)
+        }
+      }
+    }
+
+    // Apply reverse edits
+    const reverseEdits = this.edits.filter((e) => e.type === 'reverse')
+    if (reverseEdits.length > 0) {
+      for (const edit of reverseEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        for (let ch = 0; ch < result.length; ch++) {
+          const region = result[ch].subarray(start, end)
+          region.reverse()
+        }
+      }
+    }
+
+    // Apply fade-in edits
+    const fadeInEdits = this.edits.filter((e) => e.type === 'fadeIn')
+    if (fadeInEdits.length > 0) {
+      for (const edit of fadeInEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        const regionLen = end - start
+        if (regionLen <= 0) continue
+        const isExponential = edit.curve === 'exponential'
+
+        for (let ch = 0; ch < result.length; ch++) {
+          for (let i = 0; i < regionLen; i++) {
+            const t = i / regionLen
+            const gain = isExponential ? t * t : t
+            result[ch][start + i] *= gain
+          }
+        }
+      }
+    }
+
+    // Apply fade-out edits
+    const fadeOutEdits = this.edits.filter((e) => e.type === 'fadeOut')
+    if (fadeOutEdits.length > 0) {
+      for (const edit of fadeOutEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        const regionLen = end - start
+        if (regionLen <= 0) continue
+        const isExponential = edit.curve === 'exponential'
+
+        for (let ch = 0; ch < result.length; ch++) {
+          for (let i = 0; i < regionLen; i++) {
+            const t = 1 - i / regionLen
+            const gain = isExponential ? t * t : t
+            result[ch][start + i] *= gain
+          }
+        }
+      }
+    }
+
+    // Apply normalize edits
+    const normalizeEdits = this.edits.filter((e) => e.type === 'normalize')
+    if (normalizeEdits.length > 0) {
+      for (const edit of normalizeEdits) {
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+
+        const targetDb = edit.targetDb ?? -0.1
+
+        // Find peak amplitude across all channels in the region
+        let peak = 0
+        for (let ch = 0; ch < result.length; ch++) {
+          for (let i = start; i < end; i++) {
+            const abs = Math.abs(result[ch][i])
+            if (abs > peak) peak = abs
+          }
+        }
+
+        if (peak > 0) {
+          const targetLinear = Math.pow(10, targetDb / 20)
+          const factor = targetLinear / peak
+          for (let ch = 0; ch < result.length; ch++) {
+            for (let i = start; i < end; i++) {
+              result[ch][i] *= factor
+            }
+          }
         }
       }
     }

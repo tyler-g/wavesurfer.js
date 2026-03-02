@@ -287,6 +287,20 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     return channels
   }
 
+  /** Get the AudioContext instance */
+  public getAudioContext(): AudioContext {
+    return this.audioContext
+  }
+
+  /** Set an AudioBuffer directly, bypassing fetch/decode. */
+  public setAudioBuffer(audioBuffer: AudioBuffer) {
+    this.buffer = audioBuffer
+    this._duration = undefined
+    this.currentSrc = ''
+    this.emit('loadedmetadata')
+    this.emit('canplay')
+  }
+
   /**
    * Imitate `HTMLElement.removeAttribute` for compatibility with `Player`.
    */
