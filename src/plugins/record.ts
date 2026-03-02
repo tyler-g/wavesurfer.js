@@ -860,7 +860,21 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       return
     }
 
-    if (!this.originalPcm) return
+    if (!this.originalPcm) {
+      // originalPcm is missing — track was likely destroyed and re-created (undo/redo of addTrack).
+      // Bootstrap from the wavesurfer's current decoded audio (e.g. the default sample) so the
+      // splice can proceed against the same base audio that existed during the original recording.
+      const decoded = this.wavesurfer?.getDecodedData()
+      if (decoded) {
+        this.originalPcm = []
+        for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
+          this.originalPcm.push(new Float32Array(decoded.getChannelData(ch)))
+        }
+        this.pcmSampleRate = decoded.sampleRate
+      } else {
+        return
+      }
+    }
 
     const recLen = recordedPcm[0].length
 
