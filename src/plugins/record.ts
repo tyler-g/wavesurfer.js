@@ -81,6 +81,8 @@ type AudioEdit = {
   curve?: 'linear' | 'exponential'
   // Normalize params
   targetDb?: number
+  // Change Tempo params
+  tempoFactor?: number
 }
 
 type SampleRange = {
@@ -1230,6 +1232,120 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
+  /** Change tempo of a region without changing pitch (local path — times in edited space). */
+  public changeTempoRegion(
+    startTime: number,
+    endTime: number,
+    tempoFactor: number,
+    highQuality?: boolean,
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; tempoFactor: number; highQuality: boolean } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const hq = highQuality ?? false
+    const edit: AudioEdit = {
+      id,
+      type: 'changeTempo',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime,
+      endTime,
+      tempoFactor,
+      highQuality: hq,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, tempoFactor, highQuality: hq }
+  }
+
+  /** Change tempo of a region by original PCM sample coordinates (from peer). */
+  public changeTempoRegionByOriginalSamples(
+    startSample: number,
+    endSample: number,
+    tempoFactor: number,
+    highQuality?: boolean,
+    editId?: string,
+    startTime?: number,
+    endTime?: number,
+  ) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const hq = highQuality ?? false
+    const edit: AudioEdit = {
+      id,
+      type: 'changeTempo',
+      startSample,
+      endSample,
+      startTime: st,
+      endTime: et,
+      tempoFactor,
+      highQuality: hq,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
+  /** Change pitch and tempo together (local path — times in edited space). */
+  public changePitchAndTempoRegion(
+    startTime: number,
+    endTime: number,
+    semitones: number,
+  ): { id: string; startSample: number; endSample: number; startTime: number; endTime: number; semitones: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    const id = crypto.randomUUID()
+    const edit: AudioEdit = {
+      id,
+      type: 'changePitchAndTempo',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime,
+      endTime,
+      semitones,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+
+    return { id, startSample: startOriginal, endSample: endOriginal, startTime, endTime, semitones }
+  }
+
+  /** Change pitch and tempo of a region by original PCM sample coordinates (from peer). */
+  public changePitchAndTempoRegionByOriginalSamples(
+    startSample: number,
+    endSample: number,
+    semitones: number,
+    editId?: string,
+    startTime?: number,
+    endTime?: number,
+  ) {
+    const id = editId || crypto.randomUUID()
+    const st = startTime ?? startSample / this.pcmSampleRate
+    const et = endTime ?? endSample / this.pcmSampleRate
+    const edit: AudioEdit = {
+      id,
+      type: 'changePitchAndTempo',
+      startSample,
+      endSample,
+      startTime: st,
+      endTime: et,
+      semitones,
+    }
+    this.edits.push(edit)
+    this.recomputeAndReload()
+  }
+
   /** Reverse a region (local path — times in edited space). */
   public reverseRegion(
     startTime: number,
@@ -1982,6 +2098,206 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
           }
 
           // Replace the region in the result buffer
+          data.set(output, start)
+        }
+      }
+    }
+
+    // Apply changeTempo edits — WSOLA time-stretch without pitch change
+    const changeTempoEdits = this.edits.filter((e) => e.type === 'changeTempo')
+    if (changeTempoEdits.length > 0) {
+      for (const edit of changeTempoEdits) {
+        const tempoFactor = edit.tempoFactor ?? 1
+        if (tempoFactor === 1) continue
+
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        const regionLen = end - start
+        if (regionLen <= 0) continue
+
+        const highQuality = edit.highQuality ?? false
+
+        // WSOLA parameters
+        const sr = this.pcmSampleRate
+        const seqLenSamples = Math.round((highQuality ? 0.082 : 0.060) * sr)
+        const seekWindowSamples = Math.round((highQuality ? 0.028 : 0.015) * sr)
+        const overlapSamples = Math.round((highQuality ? 0.012 : 0.008) * sr)
+
+        for (let ch = 0; ch < result.length; ch++) {
+          const data = result[ch]
+          const region = new Float32Array(regionLen)
+          region.set(data.subarray(start, end))
+
+          // stretchFactor: > 1 means we want MORE output samples (slower tempo)
+          // tempoFactor > 1 = faster = fewer samples. tempoFactor < 1 = slower = more samples
+          // But we must fit back into regionLen, so we time-stretch into regionLen samples
+          // from a conceptual input of regionLen * tempoFactor samples.
+          // Actually: tempoFactor 2.0 = double speed = half length. We need to compress the
+          // audio so regionLen input maps to regionLen output but sounds faster.
+          // WSOLA stretches: stretchFactor > 1 = output longer than input.
+          // To make tempo faster (tempoFactor > 1): compress = stretchFactor < 1
+          // stretchFactor = 1 / tempoFactor
+          const stretchFactor = 1 / tempoFactor
+
+          // Effective input length after stretch
+          const stretchedLen = Math.max(1, Math.round(regionLen * stretchFactor))
+
+          // Clamp WSOLA params for short regions
+          const seqLen = Math.min(seqLenSamples, Math.floor(regionLen / 2), Math.floor(stretchedLen / 2))
+          if (seqLen < 4) {
+            // Region too short for WSOLA — fall back to resample
+            for (let i = 0; i < regionLen; i++) {
+              const srcPos = i * tempoFactor
+              const srcIdx = Math.floor(srcPos)
+              const frac = srcPos - srcIdx
+              const s0 = srcIdx < regionLen ? region[srcIdx] : 0
+              const s1 = srcIdx + 1 < regionLen ? region[srcIdx + 1] : 0
+              data[start + i] = s0 + frac * (s1 - s0)
+            }
+            continue
+          }
+          const seekWin = Math.min(seekWindowSamples, Math.floor(seqLen / 2))
+          const overlap = Math.min(overlapSamples, Math.floor(seqLen / 2))
+
+          const Hs = seqLen - overlap  // synthesis hop (output spacing)
+          const Ha = Math.max(1, Math.round(Hs / stretchFactor))  // analysis hop (input spacing)
+
+          const output = new Float32Array(regionLen)
+
+          const findBestOffset = (nominalPos: number, prevTail: Float32Array): number => {
+            let bestCorr = -Infinity
+            let bestDelta = 0
+            for (let delta = -seekWin; delta <= seekWin; delta++) {
+              const candidatePos = nominalPos + delta
+              if (candidatePos < 0 || candidatePos + overlap > regionLen) continue
+              let cross = 0
+              let energy = 0
+              for (let i = 0; i < overlap; i++) {
+                cross += prevTail[i] * region[candidatePos + i]
+                energy += region[candidatePos + i] * region[candidatePos + i]
+              }
+              const norm = energy > 1e-10 ? cross / Math.sqrt(energy) : 0
+              const dist = delta / (seekWin || 1)
+              const biased = norm * (1.0 - 0.25 * dist * dist)
+              if (biased > bestCorr) {
+                bestCorr = biased
+                bestDelta = delta
+              }
+            }
+            return bestDelta
+          }
+
+          const crossfadeFn = (
+            dst: Float32Array, dstOffset: number,
+            fadeOut: Float32Array, fadeIn: Float32Array,
+            len: number
+          ) => {
+            for (let i = 0; i < len; i++) {
+              const w = i / len
+              const idx = dstOffset + i
+              if (idx >= 0 && idx < regionLen) {
+                dst[idx] = fadeOut[i] * (1 - w) + fadeIn[i] * w
+              }
+            }
+          }
+
+          let inPos = 0
+          let outPos = 0
+
+          // First frame
+          const firstLen = Math.min(seqLen, regionLen)
+          for (let i = 0; i < firstLen; i++) {
+            output[i] = i < regionLen ? region[i] : 0
+          }
+          outPos = Hs
+          inPos = Ha
+
+          let prevTail = new Float32Array(overlap)
+          const firstTailStart = Math.max(0, firstLen - overlap)
+          for (let i = 0; i < overlap; i++) {
+            prevTail[i] = firstTailStart + i < regionLen ? region[firstTailStart + i] : 0
+          }
+
+          while (outPos < regionLen && inPos < regionLen) {
+            const nominalPos = inPos
+            const delta = findBestOffset(nominalPos, prevTail)
+            const actualPos = Math.max(0, Math.min(regionLen - seqLen, nominalPos + delta))
+
+            const fadeIn = new Float32Array(overlap)
+            for (let i = 0; i < overlap; i++) {
+              fadeIn[i] = actualPos + i < regionLen ? region[actualPos + i] : 0
+            }
+            crossfadeFn(output, outPos, prevTail, fadeIn, overlap)
+
+            const bodyStart = outPos + overlap
+            const bodyLen = Math.min(seqLen - overlap, regionLen - bodyStart)
+            for (let i = 0; i < bodyLen; i++) {
+              const srcIdx = actualPos + overlap + i
+              const dstIdx = bodyStart + i
+              if (dstIdx < regionLen) {
+                output[dstIdx] = srcIdx < regionLen ? region[srcIdx] : 0
+              }
+            }
+
+            const tailStart = actualPos + seqLen - overlap
+            prevTail = new Float32Array(overlap)
+            for (let i = 0; i < overlap; i++) {
+              prevTail[i] = tailStart + i < regionLen ? region[tailStart + i] : 0
+            }
+
+            outPos += Hs
+            inPos += Ha
+          }
+
+          data.set(output, start)
+        }
+      }
+    }
+
+    // Apply changePitchAndTempo edits — simple resampling (pitch + tempo linked)
+    const changePitchAndTempoEdits = this.edits.filter((e) => e.type === 'changePitchAndTempo')
+    if (changePitchAndTempoEdits.length > 0) {
+      for (const edit of changePitchAndTempoEdits) {
+        const semitones = edit.semitones ?? 0
+        if (semitones === 0) continue
+
+        const effStart = this.originalToEffective(edit.startSample, deleteRanges, originalLength)
+        const effEnd = this.originalToEffective(edit.endSample, deleteRanges, originalLength)
+        if (effStart < 0 || effEnd < 0) continue
+        const start = Math.max(0, Math.min(effStart, result[0].length))
+        const end = Math.max(0, Math.min(effEnd, result[0].length))
+        const regionLen = end - start
+        if (regionLen <= 0) continue
+
+        // ratio > 1 = pitch up + faster, ratio < 1 = pitch down + slower
+        const ratio = Math.pow(2, semitones / 12)
+
+        for (let ch = 0; ch < result.length; ch++) {
+          const data = result[ch]
+          const region = new Float32Array(regionLen)
+          region.set(data.subarray(start, end))
+
+          // Simple resample: read through original at 'ratio' speed
+          // Pitch UP (ratio>1): read faster, shorter output
+          // Pitch DOWN (ratio<1): read slower, longer output
+          // But we fit it back into regionLen (pad with zeros or truncate)
+          const resampledLen = Math.max(1, Math.round(regionLen / ratio))
+
+          const output = new Float32Array(regionLen)
+          const copyLen = Math.min(resampledLen, regionLen)
+          for (let i = 0; i < copyLen; i++) {
+            const srcPos = i * ratio
+            const srcIdx = Math.floor(srcPos)
+            const frac = srcPos - srcIdx
+            const s0 = srcIdx < regionLen ? region[srcIdx] : 0
+            const s1 = srcIdx + 1 < regionLen ? region[srcIdx + 1] : 0
+            output[i] = s0 + frac * (s1 - s0)
+          }
+          // Remaining samples (if resampledLen < regionLen) are zero-filled by default
+
           data.set(output, start)
         }
       }
