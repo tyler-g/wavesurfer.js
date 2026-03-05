@@ -119,6 +119,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
    *  AudioTrack event listeners should check this to avoid creating spurious
    *  history entries (which would truncate the undo/redo stack). */
   public isReloading: boolean = false
+  /** Milliseconds to trim from the front of each recording to compensate for
+   *  round-trip audio latency (output + input). Set before startRecording(). */
+  public recordingCompensationMs: number = 0
   /** Snapshot of wavesurfer's decodedData captured before recording starts.
    *  Used by undo to restore the track to its pre-recording visual+audio state. */
   private preRecordingData: { channelData: Float32Array[]; sampleRate: number } | null = null
@@ -644,6 +647,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return this.duration
   }
 
+  /** Get the current recording time (punch-in position + elapsed recording duration) in seconds */
+  public getRecordingTime(): number {
+    return this.punchInTimeSec + this.duration / 1000
+  }
+
   /** Check if the audio is being recorded */
   public isRecording(): boolean {
     return this.mediaRecorder?.state === 'recording'
@@ -747,8 +755,25 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private processPcmData() {
     if (this.recordedChunksPCM.length === 0) return
 
-    const rawRecordedPcm = this.mergePcmChunks()
+    let rawRecordedPcm = this.mergePcmChunks()
     this.recordedChunksPCM = []
+
+    const sampleRate = this.options.audioContext?.sampleRate || 44100
+
+    // Trim front of recording to compensate for round-trip latency
+    const compensationMs = this.recordingCompensationMs
+    if (compensationMs > 0 && rawRecordedPcm[0].length > 1) {
+      const samplesToTrim = Math.min(
+        Math.round((compensationMs / 1000) * sampleRate),
+        rawRecordedPcm[0].length - 1,
+      )
+      if (samplesToTrim > 0) {
+        rawRecordedPcm = rawRecordedPcm.map((ch) => ch.slice(samplesToTrim))
+        if (this.punchInSample !== null) {
+          this.punchInSample = Math.max(0, this.punchInSample - samplesToTrim)
+        }
+      }
+    }
 
     const hadEdits = this.edits.length > 0
     const wasFirstRecording = !this.originalPcm && !this.existingAudioForPunchIn
@@ -767,7 +792,6 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const overwrittenLength = overwrittenPcm?.[0]?.length ?? 0
 
     const startTime = this.punchInTimeSec
-    const sampleRate = this.options.audioContext?.sampleRate || 44100
 
     let finalPcm: Float32Array[]
     if (this.punchInSample !== null) {
@@ -964,6 +988,69 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
   public getEdits(): AudioEdit[] {
     return this.edits
+  }
+
+  /**
+   * Preview an effect on a region without applying it.
+   * Temporarily appends the edit, runs computeEffectiveAudio, restores edits,
+   * and returns just the selected region's PCM data.
+   */
+  public previewEffectOnRegion(
+    startTime: number,
+    endTime: number,
+    edit: Omit<AudioEdit, 'id' | 'startSample' | 'endSample'>
+  ): { pcm: Float32Array[]; sampleRate: number } | null {
+    if (!this.originalPcm) return null
+
+    const startEdited = Math.floor(startTime * this.pcmSampleRate)
+    const endEdited = Math.ceil(endTime * this.pcmSampleRate)
+    const startOriginal = this.editedToOriginal(startEdited)
+    const endOriginal = this.editedToOriginal(endEdited)
+
+    // Save current edits
+    const savedEdits = [...this.edits]
+
+    // Append the preview edit
+    const previewEdit: AudioEdit = {
+      ...edit,
+      id: 'preview',
+      startSample: startOriginal,
+      endSample: endOriginal,
+      startTime,
+      endTime,
+    }
+    this.edits = [...savedEdits, previewEdit]
+
+    // Compute the full effective audio with the preview edit
+    const effectivePcm = this.computeEffectiveAudio()
+
+    // Restore edits
+    this.edits = savedEdits
+
+    if (effectivePcm.length === 0 || effectivePcm[0].length === 0) return null
+
+    // Extract just the region from the effective PCM.
+    // After applying edits, the region boundaries in effective-space may shift
+    // (e.g., tempo change alters length). We need to recompute the effective
+    // positions of our original-space start/end samples against the preview edits.
+    const deleteRanges = this.mergeOverlappingRanges()
+    const originalLength = this.originalPcm[0].length
+
+    // Compute effective start/end for the region using the *original* edits
+    // (same mapping the user sees in the waveform)
+    let effStart = this.originalToEffective(startOriginal, deleteRanges, originalLength)
+    let effEnd = this.originalToEffective(endOriginal, deleteRanges, originalLength)
+    if (effStart < 0) effStart = 0
+    if (effEnd < 0) effEnd = effectivePcm[0].length
+
+    // Clamp to bounds
+    effStart = Math.max(0, Math.min(effStart, effectivePcm[0].length))
+    effEnd = Math.max(effStart, Math.min(effEnd, effectivePcm[0].length))
+
+    if (effEnd <= effStart) return null
+
+    const regionPcm = effectivePcm.map((ch) => ch.slice(effStart, effEnd))
+    return { pcm: regionPcm, sampleRate: this.pcmSampleRate }
   }
 
   public importOriginalPcm(pcm: Float32Array[], sampleRate: number) {
