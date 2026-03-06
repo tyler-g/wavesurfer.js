@@ -653,7 +653,8 @@ class Renderer extends EventEmitter<RendererEvents> {
     // Determine the width of the waveform
     const pixelRatio = this.getPixelRatio()
     const parentWidth = this.scrollContainer.clientWidth
-    const scrollWidth = Math.ceil(audioData.duration * (this.options.minPxPerSec || 0))
+    const effectiveDuration = Math.max(audioData.duration, this.options.projectDuration || 0)
+    const scrollWidth = Math.ceil(effectiveDuration * (this.options.minPxPerSec || 0))
 
     // Whether the container should scroll
     this.isScrollable = scrollWidth > parentWidth
@@ -699,7 +700,8 @@ class Renderer extends EventEmitter<RendererEvents> {
 
     const pixelRatio = this.getPixelRatio()
     const parentWidth = this.scrollContainer.clientWidth
-    const scrollWidth = Math.ceil(audioData.duration * (this.options.minPxPerSec || 0))
+    const effectiveDuration = Math.max(audioData.duration, this.options.projectDuration || 0)
+    const scrollWidth = Math.ceil(effectiveDuration * (this.options.minPxPerSec || 0))
 
     this.isScrollable = scrollWidth > parentWidth
     const useParentWidth = this.options.fillParent && !this.isScrollable

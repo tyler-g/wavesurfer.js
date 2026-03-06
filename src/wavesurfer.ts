@@ -82,6 +82,9 @@ export type WaveSurferOptions = {
   blobMimeType?: string
   /** (if WebAudio backend) AudioContext to use. If none passed a new one is created */
   audioContext?: AudioContext
+  /** Unified project duration in seconds. When set, scrollable width is based on
+   *  max(audioDuration, projectDuration) so all tracks share the same width. */
+  projectDuration?: number
 }
 
 const defaultOptions = {
@@ -210,7 +213,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   }
 
   private updateProgress(currentTime = this.getCurrentTime()): number {
-    this.renderer.renderProgress(currentTime / this.getDuration(), this.isPlaying())
+    this.renderer.renderProgress(currentTime / this.getEffectiveDuration(), this.isPlaying())
     return currentTime
   }
 
@@ -283,7 +286,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
       this.renderer.on('click', (relativeX, relativeY) => {
         if (this.options.interact) {
           this.seekTo(relativeX)
-          this.emit('interaction', relativeX * this.getDuration())
+          this.emit('interaction', relativeX * this.getEffectiveDuration())
           this.emit('click', relativeX, relativeY)
         }
       }),
@@ -295,7 +298,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
       // Scroll
       this.renderer.on('scroll', (startX, endX, scrollLeft, scrollRight) => {
-        const duration = this.getDuration()
+        const duration = this.getEffectiveDuration()
         this.emit('scroll', startX * duration, endX * duration, scrollLeft, scrollRight)
       }),
 
@@ -346,7 +349,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
             this.seekTo(relativeX)
           }, debounceTime)
 
-          this.emit('interaction', relativeX * this.getDuration())
+          this.emit('interaction', relativeX * this.getEffectiveDuration())
           this.emit('drag', relativeX)
         }),
       )
@@ -434,7 +437,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
   /** Move the start of the viewing window to a specific time in the audio (in seconds) */
   public setScrollTime(time: number) {
-    const percentage = time / this.getDuration()
+    const percentage = time / this.getEffectiveDuration()
     this.renderer.setScrollPercentage(percentage)
   }
 
@@ -560,13 +563,16 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
 
     // Update cursor/progress position BEFORE rendering so renderUpdate
-    // can draw canvases around the correct viewport
+    // can draw canvases around the correct viewport.
+    // Use the raw audio duration (not effectiveDuration) for cursor/scroll so the
+    // cursor tracks the actual recording position, not the project-wide width.
     if (currentTime !== undefined && duration > 0) {
-      const progress = Math.min(1, currentTime / duration)
+      const effectiveDuration = Math.max(duration, this.options.projectDuration || 0)
+      const progress = Math.min(1, currentTime / effectiveDuration)
 
       // Scroll to keep cursor centered (direct write — no layout reads needed)
       const minPxPerSec = this.options.minPxPerSec || 0
-      const scrollWidth = Math.ceil(duration * minPxPerSec)
+      const scrollWidth = Math.ceil(effectiveDuration * minPxPerSec)
       const clientWidth = this.getWidth()
       if (scrollWidth > clientWidth) {
         const cursorPosition = currentTime * minPxPerSec
@@ -680,6 +686,12 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     return duration
   }
 
+  /** Get the effective duration (max of audio duration and projectDuration option).
+   *  Used for scroll width, cursor positioning, and seek calculations. */
+  public getEffectiveDuration(): number {
+    return Math.max(this.getDuration(), this.options.projectDuration || 0)
+  }
+
   /** Toggle if the waveform should react to clicks */
   public toggleInteraction(isInteractive: boolean) {
     this.options.interact = isInteractive
@@ -695,7 +707,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
   /** Update visual progress without changing audio position. Used for master timeline sync. */
   public setProgress(time: number, skipScroll?: boolean) {
-    const duration = this.getDuration()
+    const duration = this.getEffectiveDuration()
     if (duration > 0) {
       this.renderer.renderProgress(time / duration, this.isPlaying(), skipScroll)
     }
@@ -703,7 +715,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
   /** Seek to a ratio of audio as [0..1] (0 = beginning, 1 = end) */
   public seekTo(progress: number) {
-    const time = this.getDuration() * progress
+    const time = this.getEffectiveDuration() * progress
     this.setTime(time)
   }
 
