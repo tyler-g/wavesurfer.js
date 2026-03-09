@@ -27,6 +27,8 @@ export type RecordPluginOptions = {
   audioContext?: AudioContext
   /** The Worker reference to use for listening to raw audio data. This can be used in combination with MediaRecorder (which does not support lossless)*/
   workerContext?: Worker
+  /** When true, recording produces standalone clip data instead of stitching into monolithic originalPcm */
+  clipMode?: boolean
 }
 
 export type RecordPluginDeviceOptions = MediaTrackConstraints
@@ -243,8 +245,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       } else if (this.options.continuousWaveform) {
         // Continuous waveform
         if (!this.dataWindow) {
-          const size = this.options.continuousWaveformDuration
-            ? Math.round(this.options.continuousWaveformDuration * FPS)
+          const baseDuration = this.options.continuousWaveformDuration || 0
+          const projectDuration = this.wavesurfer?.options.projectDuration || 0
+          const windowDuration = Math.max(baseDuration, projectDuration)
+          const size = windowDuration
+            ? Math.round(windowDuration * FPS)
             : (this.wavesurfer?.getWidth() ?? 0) * window.devicePixelRatio
           this.dataWindow = new Float32Array(size)
 
@@ -773,6 +778,29 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
           this.punchInSample = Math.max(0, this.punchInSample - samplesToTrim)
         }
       }
+    }
+
+    // Clip mode: emit raw recorded PCM as a standalone clip, skip monolithic stitch
+    if (this.options.clipMode) {
+      const startTime = this.punchInTimeSec
+      const endTime = startTime + rawRecordedPcm[0].length / sampleRate
+      this.punchInSample = null
+      this.punchInTimeSec = 0
+      this.existingAudioForPunchIn = null
+      this.emit('record-pcm-data' as any, {
+        pcm: rawRecordedPcm, startTime, endTime,
+        recordedPcm: rawRecordedPcm, punchInSample: 0,
+        overwrittenPcm: null, overwrittenLength: 0,
+        wasFirstRecording: true, hadEdits: false,
+      })
+      // Clear the continuous waveform preview so it doesn't show behind clips.
+      // Keep the current duration so zoom/scroll/getCurrentTime() remain valid.
+      if (this.dataWindow && this.wavesurfer) {
+        const currentDuration = this.wavesurfer.getDuration() || endTime + 2
+        this.dataWindow.fill(0)
+        this.wavesurfer.updatePeaks([this.dataWindow], currentDuration)
+      }
+      return
     }
 
     const hadEdits = this.edits.length > 0

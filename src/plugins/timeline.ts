@@ -184,7 +184,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.unsubscribeNotches.forEach((unsubscribe) => unsubscribe())
     this.unsubscribeNotches = []
 
-    const duration = this.wavesurfer?.getDuration() ?? this.options.duration ?? 0
+    const duration = this.wavesurfer?.getEffectiveDuration() ?? this.options.duration ?? 0
     const pxPerSec = (this.wavesurfer?.getWrapper().scrollWidth || this.timelineWrapper.scrollWidth) / duration
     const timeInterval = this.options.timeInterval ?? this.defaultTimeInterval(pxPerSec)
     const primaryLabelInterval = this.options.primaryLabelInterval ?? this.defaultPrimaryLabelInterval(pxPerSec)

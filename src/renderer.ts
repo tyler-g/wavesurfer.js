@@ -1,5 +1,6 @@
 import { makeDraggable } from './draggable.js'
 import EventEmitter from './event-emitter.js'
+import { renderWaveform as renderWaveformShared, convertColorValues } from './render-waveform.js'
 import type { WaveSurferOptions } from './wavesurfer.js'
 
 type RendererEvents = {
@@ -322,130 +323,8 @@ class Renderer extends EventEmitter<RendererEvents> {
     }
   }
 
-  // Convert array of color values to linear gradient
-  private convertColorValues(color?: WaveSurferOptions['waveColor']): string | CanvasGradient {
-    if (!Array.isArray(color)) return color || ''
-    if (color.length < 2) return color[0] || ''
-
-    const canvasElement = document.createElement('canvas')
-    const ctx = canvasElement.getContext('2d') as CanvasRenderingContext2D
-    const gradientHeight = canvasElement.height * (window.devicePixelRatio || 1)
-    const gradient = ctx.createLinearGradient(0, 0, 0, gradientHeight)
-
-    const colorStopPercentage = 1 / (color.length - 1)
-    color.forEach((color, index) => {
-      const offset = index * colorStopPercentage
-      gradient.addColorStop(offset, color)
-    })
-
-    return gradient
-  }
-
   private getPixelRatio() {
     return Math.max(1, window.devicePixelRatio || 1)
-  }
-
-  private renderBarWaveform(
-    channelData: Array<Float32Array | number[]>,
-    options: WaveSurferOptions,
-    ctx: CanvasRenderingContext2D,
-    vScale: number,
-  ) {
-    const topChannel = channelData[0]
-    const bottomChannel = channelData[1] || channelData[0]
-    const length = topChannel.length
-
-    const { width, height } = ctx.canvas
-    const halfHeight = height / 2
-    const pixelRatio = this.getPixelRatio()
-
-    const barWidth = options.barWidth ? options.barWidth * pixelRatio : 1
-    const barGap = options.barGap ? options.barGap * pixelRatio : options.barWidth ? barWidth / 2 : 0
-    const barRadius = options.barRadius || 0
-    const barIndexScale = width / (barWidth + barGap) / length
-
-    const rectFn = barRadius && 'roundRect' in ctx ? 'roundRect' : 'rect'
-
-    ctx.beginPath()
-
-    let prevX = 0
-    let maxTop = 0
-    let maxBottom = 0
-    for (let i = 0; i <= length; i++) {
-      const x = Math.round(i * barIndexScale)
-
-      if (x > prevX) {
-        const topBarHeight = Math.round(maxTop * halfHeight * vScale)
-        const bottomBarHeight = Math.round(maxBottom * halfHeight * vScale)
-        const barHeight = topBarHeight + bottomBarHeight || 1
-
-        // Vertical alignment
-        let y = halfHeight - topBarHeight
-        if (options.barAlign === 'top') {
-          y = 0
-        } else if (options.barAlign === 'bottom') {
-          y = height - barHeight
-        }
-
-        ctx[rectFn](prevX * (barWidth + barGap), y, barWidth, barHeight, barRadius)
-
-        prevX = x
-        maxTop = 0
-        maxBottom = 0
-      }
-
-      const magnitudeTop = Math.abs(topChannel[i] || 0)
-      const magnitudeBottom = Math.abs(bottomChannel[i] || 0)
-      if (magnitudeTop > maxTop) maxTop = magnitudeTop
-      if (magnitudeBottom > maxBottom) maxBottom = magnitudeBottom
-    }
-
-    ctx.fill()
-    ctx.closePath()
-  }
-
-  private renderLineWaveform(
-    channelData: Array<Float32Array | number[]>,
-    _options: WaveSurferOptions,
-    ctx: CanvasRenderingContext2D,
-    vScale: number,
-  ) {
-    const drawChannel = (index: number) => {
-      const channel = channelData[index] || channelData[0]
-      const length = channel.length
-      const { height } = ctx.canvas
-      const halfHeight = height / 2
-      const hScale = ctx.canvas.width / length
-
-      ctx.moveTo(0, halfHeight)
-
-      let prevX = 0
-      let max = 0
-      for (let i = 0; i <= length; i++) {
-        const x = Math.round(i * hScale)
-
-        if (x > prevX) {
-          const h = Math.round(max * halfHeight * vScale) || 1
-          const y = halfHeight + h * (index === 0 ? -1 : 1)
-          ctx.lineTo(prevX, y)
-          prevX = x
-          max = 0
-        }
-
-        const value = Math.abs(channel[i] || 0)
-        if (value > max) max = value
-      }
-
-      ctx.lineTo(prevX, halfHeight)
-    }
-
-    ctx.beginPath()
-
-    drawChannel(0)
-    drawChannel(1)
-
-    ctx.fill()
-    ctx.closePath()
   }
 
   private renderWaveform(
@@ -453,29 +332,22 @@ class Renderer extends EventEmitter<RendererEvents> {
     options: WaveSurferOptions,
     ctx: CanvasRenderingContext2D,
   ) {
-    ctx.fillStyle = this.convertColorValues(options.waveColor)
-
     // Custom rendering function
     if (options.renderFunction) {
+      ctx.fillStyle = convertColorValues(options.waveColor)
       options.renderFunction(channelData, ctx)
       return
     }
 
-    // Vertical scaling
-    let vScale = options.barHeight || 1
-    if (options.normalize) {
-      const max = Array.from(channelData[0]).reduce((max, value) => Math.max(max, Math.abs(value)), 0)
-      vScale = max ? 1 / max : 1
-    }
-
-    // Render waveform as bars
-    if (options.barWidth || options.barGap || options.barAlign) {
-      this.renderBarWaveform(channelData, options, ctx, vScale)
-      return
-    }
-
-    // Render waveform as a polyline
-    this.renderLineWaveform(channelData, options, ctx, vScale)
+    renderWaveformShared(channelData, ctx, {
+      waveColor: options.waveColor,
+      barWidth: options.barWidth,
+      barGap: options.barGap,
+      barRadius: options.barRadius,
+      barHeight: options.barHeight,
+      barAlign: options.barAlign,
+      normalize: options.normalize,
+    })
   }
 
   private renderSingleCanvas(
@@ -507,7 +379,7 @@ class Renderer extends EventEmitter<RendererEvents> {
       progressCtx.drawImage(canvas, 0, 0)
       // Set the composition method to draw only where the waveform is drawn
       progressCtx.globalCompositeOperation = 'source-in'
-      progressCtx.fillStyle = this.convertColorValues(options.progressColor)
+      progressCtx.fillStyle = convertColorValues(options.progressColor)
       // This rectangle acts as a mask thanks to the composition method
       progressCtx.fillRect(0, 0, canvas.width, canvas.height)
       progressContainer.appendChild(progressCanvas)
@@ -828,7 +700,7 @@ class Renderer extends EventEmitter<RendererEvents> {
             progressCtx.clearRect(0, 0, progressCanvas.width, progressCanvas.height)
             progressCtx.drawImage(canvas, 0, 0)
             progressCtx.globalCompositeOperation = 'source-in'
-            progressCtx.fillStyle = this.convertColorValues(options.progressColor)
+            progressCtx.fillStyle = convertColorValues(options.progressColor)
             progressCtx.fillRect(0, 0, progressCanvas.width, progressCanvas.height)
           }
         }
