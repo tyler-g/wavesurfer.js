@@ -35,6 +35,7 @@ export type ClipParams = {
   id: string
   startTime: number // seconds
   duration: number // seconds
+  originalDuration?: number // seconds — the original audio length (for looping/clipping)
   color?: string
   name?: string
   peaks?: number[] | null
@@ -47,6 +48,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public id: string
   public startTime: number
   public duration: number
+  public originalDuration: number
   public color: string
   public name: string
   public peaks: number[] | null
@@ -60,6 +62,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.id = params.id
     this.startTime = Math.max(0, params.startTime)
     this.duration = Math.max(0, params.duration)
+    this.originalDuration = params.originalDuration ?? this.duration
     this.color = params.color ?? 'rgba(56, 178, 172, 0.6)'
     this.name = params.name ?? ''
     this.peaks = params.peaks ?? null
@@ -236,6 +239,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.startTime = newStart
         this.duration = newDuration
         this.renderPosition()
+        this.renderWaveform()
         this.emit('update', 'start')
       }
     } else {
@@ -243,6 +247,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       if (newDuration > 0.01) {
         this.duration = newDuration
         this.renderPosition()
+        this.renderWaveform()
         this.emit('update', 'end')
       }
     }
@@ -258,6 +263,34 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const widthPct = (this.duration / this.totalDuration) * 100
     this.element.style.left = `${startPct}%`
     this.element.style.width = `${widthPct}%`
+  }
+
+  /**
+   * Build display peaks that correctly represent looped or truncated audio.
+   * When duration > originalDuration, tiles the peaks. When smaller, truncates.
+   */
+  private buildDisplayPeaks(peaks: number[], numBins: number): number[] {
+    const origDur = this.originalDuration
+    const curDur = this.duration
+
+    // If durations match (or no original duration info), use peaks as-is
+    if (!origDur || origDur <= 0 || Math.abs(curDur - origDur) < 0.001) {
+      return peaks
+    }
+
+    const result: number[] = new Array(numBins)
+    for (let i = 0; i < numBins; i++) {
+      // Map this bin's time position, wrapping around for looping
+      const timeInNew = ((i + 0.5) / numBins) * curDur
+      const timeInOriginal = timeInNew % origDur
+      const posInOriginal = timeInOriginal / origDur
+      const origIndex = Math.min(
+        Math.floor(posInOriginal * peaks.length),
+        peaks.length - 1
+      )
+      result[i] = peaks[origIndex]
+    }
+    return result
   }
 
   public renderWaveform() {
@@ -296,7 +329,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
       ctx.clearRect(0, 0, pixelW, pixelH)
 
-      renderWaveform([this.peaks], ctx, {
+      // Build display peaks with looping/truncation applied
+      const displayBins = Math.max(pixelW, this.peaks.length)
+      const displayPeaks = this.buildDisplayPeaks(this.peaks, displayBins)
+
+      renderWaveform([displayPeaks], ctx, {
         waveColor: 'rgba(255,255,255,0.4)',
       })
     })
@@ -329,6 +366,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public setPeaks(peaks: number[] | null) {
     this.peaks = peaks
     this.renderWaveform()
+  }
+
+  public setOriginalDuration(dur: number) {
+    this.originalDuration = dur
   }
 
   public updateTotalDuration(totalDuration: number) {
