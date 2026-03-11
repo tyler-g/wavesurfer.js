@@ -18,6 +18,7 @@ export type ClipsPluginEvents = BasePluginEvents & {
   'clip-drag-end': [clip: ClipBlockImpl]
   'clip-resize-end': [clip: ClipBlockImpl, side: 'start' | 'end']
   'clip-clicked': [clip: ClipBlockImpl, e: MouseEvent]
+  'clip-dblclick': [clip: ClipBlockImpl, e: MouseEvent]
   'clip-context-menu': [clip: ClipBlockImpl, e: MouseEvent]
   'clip-selected': [clip: ClipBlockImpl]
   'clip-updated': [clip: ClipBlockImpl]
@@ -28,6 +29,7 @@ export type ClipBlockEvents = {
   update: [side?: 'start' | 'end']
   'update-end': [side?: 'start' | 'end']
   click: [event: MouseEvent]
+  dblclick: [event: MouseEvent]
   'context-menu': [event: MouseEvent]
 }
 
@@ -105,14 +107,19 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         maxWidth: 'calc(100% - 8px)',
-        pointerEvents: 'none',
+        pointerEvents: 'auto',
         userSelect: 'none',
         zIndex: '3',
         textShadow: '0 1px 2px rgba(0,0,0,0.5)',
         fontFamily: 'system-ui, sans-serif',
         lineHeight: '14px',
+        cursor: 'default',
       },
       textContent: this.name,
+    })
+    label.addEventListener('dblclick', (e) => {
+      e.stopPropagation()
+      this.emit('dblclick', e)
     })
     element.appendChild(label)
 
@@ -363,6 +370,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     }
   }
 
+  public getLabelElement(): HTMLElement | null {
+    if (!this.element) return null
+    return this.element.querySelector('div') as HTMLElement | null
+  }
+
   public setPeaks(peaks: number[] | null) {
     this.peaks = peaks
     this.renderWaveform()
@@ -451,6 +463,7 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
 
     // Forward clip events to plugin events
     clip.on('click', (e) => this.emit('clip-clicked', clip, e))
+    clip.on('dblclick', (e) => this.emit('clip-dblclick', clip, e))
     clip.on('context-menu', (e) => this.emit('clip-context-menu', clip, e))
     clip.on('update-end', (side) => {
       if (side === 'start' || side === 'end') {

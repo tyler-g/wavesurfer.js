@@ -640,7 +640,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
   /** Zoom the waveform by a given pixels-per-second factor */
   public zoom(minPxPerSec: number) {
     if (!this.decodedData) {
-      throw new Error('No audio loaded')
+      return
     }
     this.renderer.zoom(minPxPerSec)
     this.emit('zoom', minPxPerSec)
