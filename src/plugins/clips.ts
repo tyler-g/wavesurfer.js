@@ -33,6 +33,18 @@ export type ClipBlockEvents = {
   'context-menu': [event: MouseEvent]
 }
 
+/**
+ * Custom render function for clip canvas content.
+ * Called instead of the default waveform renderer when provided.
+ * Receives the canvas context, pixel dimensions, and the clip instance.
+ */
+export type ClipRenderFn = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  clip: ClipBlockImpl,
+) => void
+
 export type ClipParams = {
   id: string
   startTime: number // seconds
@@ -42,6 +54,10 @@ export type ClipParams = {
   name?: string
   peaks?: number[] | null
   selected?: boolean
+  /** Custom render function — replaces waveform rendering when provided */
+  renderContent?: ClipRenderFn
+  /** Arbitrary data attached to the clip (e.g., MidiNote[] for MIDI clips) */
+  data?: any
 }
 
 class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
@@ -55,6 +71,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public name: string
   public peaks: number[] | null
   public selected: boolean
+  public renderContent: ClipRenderFn | undefined
+  public data: any
   public subscriptions: (() => void)[] = []
   private totalDuration: number
   private isRemoved = false
@@ -69,6 +87,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.name = params.name ?? ''
     this.peaks = params.peaks ?? null
     this.selected = params.selected ?? false
+    this.renderContent = params.renderContent
+    this.data = params.data
     this.totalDuration = Math.max(totalDuration, 0.001)
     this.element = this.initElement()
     this.renderPosition()
@@ -301,11 +321,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   }
 
   public renderWaveform() {
-    if (!this.canvas || !this.peaks || this.peaks.length === 0) return
+    if (!this.canvas) return
+    // For custom-rendered clips, peaks are optional
+    if (!this.renderContent && (!this.peaks || this.peaks.length === 0)) return
 
     // Debounce canvas sizing to avoid layout thrashing
     requestAnimationFrame(() => {
-      if (!this.canvas || !this.peaks) return
+      if (!this.canvas) return
+      if (!this.renderContent && !this.peaks) return
 
       const clipEl = this.canvas.parentElement
       const rect = clipEl?.getBoundingClientRect()
@@ -336,13 +359,18 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
       ctx.clearRect(0, 0, pixelW, pixelH)
 
-      // Build display peaks with looping/truncation applied
-      const displayBins = Math.max(pixelW, this.peaks.length)
-      const displayPeaks = this.buildDisplayPeaks(this.peaks, displayBins)
+      // Use custom render function if provided, otherwise render waveform
+      if (this.renderContent) {
+        this.renderContent(ctx, pixelW, pixelH, this)
+      } else if (this.peaks) {
+        // Build display peaks with looping/truncation applied
+        const displayBins = Math.max(pixelW, this.peaks.length)
+        const displayPeaks = this.buildDisplayPeaks(this.peaks, displayBins)
 
-      renderWaveform([displayPeaks], ctx, {
-        waveColor: 'rgba(255,255,255,0.4)',
-      })
+        renderWaveform([displayPeaks], ctx, {
+          waveColor: 'rgba(255,255,255,0.4)',
+        })
+      }
     })
   }
 
@@ -377,6 +405,16 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
   public setPeaks(peaks: number[] | null) {
     this.peaks = peaks
+    this.renderWaveform()
+  }
+
+  public setRenderContent(fn: ClipRenderFn | undefined) {
+    this.renderContent = fn
+    this.renderWaveform()
+  }
+
+  public setData(data: any) {
+    this.data = data
     this.renderWaveform()
   }
 
