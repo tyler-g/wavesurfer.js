@@ -98,6 +98,8 @@ class ZoomPlugin extends BasePlugin<ZoomPluginEvents, ZoomPluginOptions> {
     if (!this.wavesurfer || !this.container || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) {
       return
     }
+    // Only zoom on pinch gesture (ctrlKey) or Ctrl+scroll wheel — not plain two-finger scroll
+    if (!e.ctrlKey) return
     // prevent scrolling the sidebar while zooming
     e.preventDefault()
 
