@@ -646,6 +646,15 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     this.emit('zoom', minPxPerSec)
   }
 
+  /** Zoom and set scroll position atomically (pointer-anchored zoom). */
+  public zoomAndScroll(minPxPerSec: number, scrollLeft: number) {
+    if (!this.decodedData) {
+      return
+    }
+    this.renderer.zoomAndScroll(minPxPerSec, scrollLeft)
+    this.emit('zoom', minPxPerSec)
+  }
+
   /** Get the decoded audio data */
   public getDecodedData(): AudioBuffer | null {
     return this.decodedData

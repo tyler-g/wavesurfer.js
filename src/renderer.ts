@@ -28,6 +28,7 @@ class Renderer extends EventEmitter<RendererEvents> {
   private timeouts: Array<() => void> = []
   private isScrollable = false
   private audioData: AudioBuffer | null = null
+  private autoScrollSuppressedUntil = 0
   private resizeObserver: ResizeObserver | null = null
   private lastContainerWidth = 0
   private isDragging = false
@@ -748,7 +749,43 @@ class Renderer extends EventEmitter<RendererEvents> {
     this.reRender()
   }
 
+  /** Zoom and set scroll position atomically, bypassing the cursor-anchored scroll adjustment in reRender(). */
+  zoomAndScroll(minPxPerSec: number, scrollLeft: number) {
+    this.options.minPxPerSec = minPxPerSec
+
+    this.unsubscribeOnScroll.forEach((unsubscribe) => unsubscribe())
+    this.unsubscribeOnScroll = []
+
+    if (!this.audioData) return
+
+    // Compute the new wrapper width and set it before render so scrollLeft isn't clamped
+    const effectiveDuration = Math.max(this.audioData.duration, this.options.projectDuration || 0)
+    const newScrollWidth = Math.ceil(effectiveDuration * minPxPerSec)
+    const parentWidth = this.scrollContainer.clientWidth
+    const isScrollable = newScrollWidth > parentWidth
+    const useParentWidth = this.options.fillParent && !isScrollable
+    this.wrapper.style.width = useParentWidth ? '100%' : `${newScrollWidth}px`
+
+    // Force layout so the browser knows the new scrollWidth before we set scrollLeft
+    void this.scrollContainer.scrollWidth
+
+    // Set scroll position BEFORE render to avoid any clamping
+    this.scrollContainer.scrollLeft = scrollLeft
+
+    this.render(this.audioData)
+
+    // Re-set scroll after render in case render changed wrapper width
+    this.scrollContainer.scrollLeft = scrollLeft
+
+    // Suppress autoScroll for 300ms so the timer's renderProgress doesn't
+    // immediately nudge scrollLeft back toward the playback cursor
+    this.autoScrollSuppressedUntil = performance.now() + 300
+  }
+
   private scrollIntoView(progress: number, isPlaying = false) {
+    // Skip auto-scroll during active zooming to preserve pointer-anchored position
+    if (this.autoScrollSuppressedUntil > performance.now()) return
+
     const { scrollLeft, scrollWidth, clientWidth } = this.scrollContainer
     const progressWidth = progress * scrollWidth
     const startEdge = scrollLeft

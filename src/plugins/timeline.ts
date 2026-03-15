@@ -32,6 +32,14 @@ export type TimelinePluginOptions = {
   formatTimeCallback?: (seconds: number) => string
   /** Opacity of the secondary labels, defaults to 0.25 */
   secondaryLabelOpacity?: number
+  /** Show vertical grid lines extending through the track waveform area, defaults to false */
+  gridLines?: boolean
+  /** Color of the grid lines, defaults to 'rgba(255, 255, 255, 0.05)' */
+  gridLinesColor?: string
+  /** Grid line placement mode: 'beats' places at beat positions based on tempo, 'seconds' places at every time notch. Defaults to 'beats'. */
+  gridMode?: 'beats' | 'seconds'
+  /** Tempo in BPM for beat-based grid lines. Required when gridMode is 'beats'. Defaults to 120. */
+  tempo?: number
 }
 
 const defaultOptions = {
@@ -56,13 +64,20 @@ export type TimelinePluginEvents = BasePluginEvents & {
 
 class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOptions> {
   private timelineWrapper: HTMLElement
+  private gridOverlay: HTMLElement | null = null
   private unsubscribeNotches: (() => void)[] = []
   protected options: TimelinePluginOptions & typeof defaultOptions
+  private gridLinesEnabled: boolean = false
+  private gridMode: 'beats' | 'seconds' = 'beats'
+  private tempo: number = 120
 
   constructor(options?: TimelinePluginOptions) {
     super(options || {})
 
     this.options = Object.assign({}, defaultOptions, options)
+    this.gridLinesEnabled = options?.gridLines ?? false
+    this.gridMode = options?.gridMode ?? 'beats'
+    this.tempo = options?.tempo ?? 120
     this.timelineWrapper = this.initTimelineWrapper()
   }
 
@@ -94,6 +109,23 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       container.appendChild(this.timelineWrapper)
     }
 
+    // Create grid overlay inside the wavesurfer wrapper (sibling to canvases)
+    // so it's not clipped by the scroll container's overflow-y: hidden
+    const wrapper = this.wavesurfer.getWrapper()
+    this.gridOverlay = createElement('div', {
+      part: 'timeline-grid',
+      style: {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        width: '100%',
+        height: '100%',
+        pointerEvents: 'none',
+        zIndex: '1',
+      },
+    })
+    wrapper.appendChild(this.gridOverlay)
+
     this.subscriptions.push(this.wavesurfer.on('redraw', () => this.initTimeline()))
 
     if (this.wavesurfer?.getDuration() || this.options.duration) {
@@ -101,11 +133,29 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     }
   }
 
+  /** Toggle vertical grid lines extending through the track waveform area */
+  public setGridLines(enabled: boolean) {
+    this.gridLinesEnabled = enabled
+    this.initTimeline()
+  }
+
+  /** Returns whether grid lines are currently enabled */
+  public getGridLines(): boolean {
+    return this.gridLinesEnabled
+  }
+
+  /** Update the tempo (BPM) and re-render beat-based grid lines */
+  public setTempo(bpm: number) {
+    this.tempo = bpm
+    this.initTimeline()
+  }
+
   /** Unmount */
   public destroy() {
     this.unsubscribeNotches.forEach((unsubscribe) => unsubscribe())
     this.unsubscribeNotches = []
     this.timelineWrapper.remove()
+    this.gridOverlay?.remove()
     super.destroy()
   }
 
@@ -180,6 +230,12 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     )
   }
 
+  private clearChildren(el: HTMLElement) {
+    while (el.firstChild) {
+      el.removeChild(el.firstChild)
+    }
+  }
+
   private initTimeline() {
     this.unsubscribeNotches.forEach((unsubscribe) => unsubscribe())
     this.unsubscribeNotches = []
@@ -192,6 +248,9 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     const secondaryLabelInterval = this.options.secondaryLabelInterval ?? this.defaultSecondaryLabelInterval(pxPerSec)
     const secondaryLabelSpacing = this.options.secondaryLabelSpacing
     const isTop = this.options.insertPosition === 'beforebegin'
+
+    const gridLines = this.gridLinesEnabled
+    const gridLinesColor = this.options.gridLinesColor ?? 'rgba(255, 255, 255, 0.12)'
 
     const timeline = createElement('div', {
       style: {
@@ -238,6 +297,12 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       },
     })
 
+    // Clear grid overlay
+    if (this.gridOverlay) {
+      this.clearChildren(this.gridOverlay)
+      this.gridOverlay.style.display = gridLines ? '' : 'none'
+    }
+
     for (let i = 0, notches = 0; i < duration; i += timeInterval, notches++) {
       const notch = notchEl.cloneNode() as HTMLElement
       const isPrimary =
@@ -260,9 +325,48 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       const offset = (Math.round((i + this.options.timeOffset) * 100) / 100) * pxPerSec
       notch.style.left = `${offset}px`
       this.virtualAppend(offset, timeline, notch)
+
+      // Add grid line at every notch when in 'seconds' mode
+      if (gridLines && this.gridMode === 'seconds' && this.gridOverlay) {
+        const gridLine = createElement('div', {
+          style: {
+            position: 'absolute',
+            top: '0',
+            left: `${offset}px`,
+            width: '1px',
+            height: '100%',
+            backgroundColor: gridLinesColor,
+            pointerEvents: 'none',
+          },
+        })
+        this.virtualAppend(offset, this.gridOverlay, gridLine)
+      }
     }
 
-    this.timelineWrapper.innerHTML = ''
+    // Add beat-based grid lines when in 'beats' mode (default)
+    if (gridLines && this.gridMode === 'beats' && this.gridOverlay) {
+      const beatDuration = 60 / this.tempo
+      for (let beatIndex = 0; beatIndex * beatDuration < duration; beatIndex++) {
+        const beatTime = beatIndex * beatDuration
+        const offset = (Math.round((beatTime + this.options.timeOffset) * 100) / 100) * pxPerSec
+        const isBarLine = beatIndex % 4 === 0
+        const gridLine = createElement('div', {
+          style: {
+            position: 'absolute',
+            top: '0',
+            left: `${offset}px`,
+            width: '1px',
+            height: '100%',
+            backgroundColor: gridLinesColor,
+            opacity: isBarLine ? '1' : '0.4',
+            pointerEvents: 'none',
+          },
+        })
+        this.virtualAppend(offset, this.gridOverlay, gridLine)
+      }
+    }
+
+    this.clearChildren(this.timelineWrapper)
     this.timelineWrapper.appendChild(timeline)
 
     this.emit('ready')
