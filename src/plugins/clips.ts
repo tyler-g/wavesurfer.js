@@ -100,6 +100,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (this.isRemoved) return null
 
     const element = createElement('div', {
+      class: 'ws-clip',
       style: {
         position: 'absolute',
         top: '0',
@@ -108,7 +109,6 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         borderRadius: '3px',
         boxSizing: 'border-box',
         border: this.selected ? '2px solid #fff' : '1px solid rgba(255,255,255,0.3)',
-        cursor: 'grab',
         pointerEvents: 'all',
         overflow: 'hidden',
         zIndex: '2',
@@ -225,16 +225,22 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.emit('context-menu', e)
     })
 
+    // Track mouse position for cut-line indicator
+    element.addEventListener('mousemove', (e) => {
+      const rect = element.getBoundingClientRect()
+      element.style.setProperty('--cut-x', `${e.clientX - rect.left}px`)
+    })
+
     // Drag
     this.subscriptions.push(
       makeDraggable(
         element,
         (dx) => this.onMove(dx),
         () => {
-          if (element.style) element.style.cursor = 'grabbing'
+          element.classList.add('ws-clip--dragging')
         },
         () => {
-          if (element.style) element.style.cursor = 'grab'
+          element.classList.remove('ws-clip--dragging')
           this.emit('update-end')
         },
       ),
@@ -484,6 +490,12 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
     this.subscriptions.push(
       this.wavesurfer.on('zoom', () => {
         // Re-render waveforms on zoom since canvas dimensions change
+        this.clips.forEach((clip) => clip.renderWaveform())
+      }),
+    )
+    this.subscriptions.push(
+      this.wavesurfer.on('redraw', () => {
+        // Re-render waveforms when track height changes
         this.clips.forEach((clip) => clip.renderWaveform())
       }),
     )

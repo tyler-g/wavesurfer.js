@@ -40,6 +40,8 @@ export type TimelinePluginOptions = {
   gridMode?: 'beats' | 'seconds'
   /** Tempo in BPM for beat-based grid lines. Required when gridMode is 'beats'. Defaults to 120. */
   tempo?: number
+  /** Grid subdivision as a snap grid value (e.g. '1 Bar', '1/4', '1/8', '1/16T'). Controls grid line density. Defaults to '1/4' (every beat). */
+  gridSubdivision?: string
 }
 
 const defaultOptions = {
@@ -70,6 +72,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
   private gridLinesEnabled: boolean = false
   private gridMode: 'beats' | 'seconds' = 'beats'
   private tempo: number = 120
+  private gridSubdivision: string = '1/4'
 
   constructor(options?: TimelinePluginOptions) {
     super(options || {})
@@ -78,6 +81,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.gridLinesEnabled = options?.gridLines ?? false
     this.gridMode = options?.gridMode ?? 'beats'
     this.tempo = options?.tempo ?? 120
+    this.gridSubdivision = options?.gridSubdivision ?? '1/4'
     this.timelineWrapper = this.initTimelineWrapper()
   }
 
@@ -147,6 +151,12 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
   /** Update the tempo (BPM) and re-render beat-based grid lines */
   public setTempo(bpm: number) {
     this.tempo = bpm
+    this.initTimeline()
+  }
+
+  /** Update the grid subdivision (e.g. '1 Bar', '1/4', '1/8T') and re-render */
+  public setGridSubdivision(value: string) {
+    this.gridSubdivision = value
     this.initTimeline()
   }
 
@@ -346,10 +356,16 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     // Add beat-based grid lines when in 'beats' mode (default)
     if (gridLines && this.gridMode === 'beats' && this.gridOverlay) {
       const beatDuration = 60 / this.tempo
-      for (let beatIndex = 0; beatIndex * beatDuration < duration; beatIndex++) {
-        const beatTime = beatIndex * beatDuration
-        const offset = (Math.round((beatTime + this.options.timeOffset) * 100) / 100) * pxPerSec
-        const isBarLine = beatIndex % 4 === 0
+      const barDuration = beatDuration * 4
+      const gridInterval = this.subdivisionToSeconds(this.gridSubdivision, beatDuration, barDuration)
+
+      for (let i = 0; i * gridInterval < duration; i++) {
+        const time = i * gridInterval
+        const offset = (Math.round((time + this.options.timeOffset) * 100) / 100) * pxPerSec
+        // Bar lines at full opacity, beat lines at medium, sub-beat at low
+        const atBar = barDuration > 0 && Math.abs(time % barDuration) < 0.001
+        const atBeat = beatDuration > 0 && Math.abs(time % beatDuration) < 0.001
+        const opacity = atBar ? '1' : atBeat ? '0.4' : '0.18'
         const gridLine = createElement('div', {
           style: {
             position: 'absolute',
@@ -358,7 +374,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
             width: '1px',
             height: '100%',
             backgroundColor: gridLinesColor,
-            opacity: isBarLine ? '1' : '0.4',
+            opacity,
             pointerEvents: 'none',
           },
         })
@@ -370,6 +386,26 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.timelineWrapper.appendChild(timeline)
 
     this.emit('ready')
+  }
+
+  /** Convert a grid subdivision string to a duration in seconds */
+  private subdivisionToSeconds(sub: string, beatDuration: number, barDuration: number): number {
+    switch (sub) {
+      case '8 Bars': return barDuration * 8
+      case '4 Bars': return barDuration * 4
+      case '2 Bars': return barDuration * 2
+      case '1 Bar': return barDuration
+      case '1/2': return beatDuration * 2
+      case '1/2T': return (beatDuration * 2) * 2 / 3
+      case '1/4': return beatDuration
+      case '1/4T': return beatDuration * 2 / 3
+      case '1/8': return beatDuration / 2
+      case '1/8T': return beatDuration / 3
+      case '1/16': return beatDuration / 4
+      case '1/16T': return beatDuration / 6
+      case '1/32': return beatDuration / 8
+      default: return beatDuration // fallback to quarter note
+    }
   }
 }
 

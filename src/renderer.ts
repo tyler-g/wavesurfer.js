@@ -237,6 +237,27 @@ class Renderer extends EventEmitter<RendererEvents> {
           height: 100%;
           border-radius: 2px;
         }
+        .ws-clip {
+          cursor: grab;
+        }
+        .ws-clip--dragging {
+          cursor: grabbing;
+        }
+        :host-context(.daw-tracks-container--cut) .ws-clip {
+          cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23fcc419' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6' cy='6' r='3'/%3E%3Ccircle cx='6' cy='18' r='3'/%3E%3Cline x1='20' y1='4' x2='8.12' y2='15.88'/%3E%3Cline x1='14.47' y1='14.48' x2='20' y2='20'/%3E%3Cline x1='8.12' y1='8.12' x2='12' y2='12'/%3E%3C/svg%3E") 12 12, crosshair;
+        }
+        :host-context(.daw-tracks-container--cut) .ws-clip:hover::after {
+          content: '';
+          position: absolute;
+          top: 0;
+          bottom: 0;
+          left: var(--cut-x, 0px);
+          width: 1px;
+          background: #fcc419;
+          pointer-events: none;
+          z-index: 10;
+          box-shadow: 0 0 4px rgba(252, 196, 25, 0.5);
+        }
       </style>
 
       <div class="scroll" part="scroll">
