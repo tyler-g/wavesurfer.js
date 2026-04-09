@@ -70,6 +70,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public color: string
   public name: string
   public peaks: number[] | null
+  public peaksPreLooped: boolean
   public selected: boolean
   public renderContent: ClipRenderFn | undefined
   public data: any
@@ -86,6 +87,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.color = params.color ?? 'rgba(56, 178, 172, 0.6)'
     this.name = params.name ?? ''
     this.peaks = params.peaks ?? null
+    this.peaksPreLooped = false
     this.selected = params.selected ?? false
     this.renderContent = params.renderContent
     this.data = params.data
@@ -306,6 +308,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const origDur = this.originalDuration
     const curDur = this.duration
 
+    // If peaks are already looped (from store resize), skip re-looping
+    if (this.peaksPreLooped) {
+      return peaks
+    }
+
     // If durations match (or no original duration info), use peaks as-is
     if (!origDur || origDur <= 0 || Math.abs(curDur - origDur) < 0.001) {
       return peaks
@@ -409,8 +416,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     return this.element.querySelector('div') as HTMLElement | null
   }
 
-  public setPeaks(peaks: number[] | null) {
+  public setPeaks(peaks: number[] | null, preLooped = false) {
     this.peaks = peaks
+    this.peaksPreLooped = preLooped
     this.renderWaveform()
   }
 
