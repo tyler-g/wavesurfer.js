@@ -71,6 +71,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public name: string
   public peaks: number[] | null
   public peaksPreLooped: boolean
+  private originalPeaks: number[] | null
   public selected: boolean
   public renderContent: ClipRenderFn | undefined
   public data: any
@@ -88,6 +89,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.name = params.name ?? ''
     this.peaks = params.peaks ?? null
     this.peaksPreLooped = false
+    this.originalPeaks = this.peaks ? [...this.peaks] : null
     this.selected = params.selected ?? false
     this.renderContent = params.renderContent
     this.data = params.data
@@ -267,6 +269,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const { width } = this.element.parentElement.getBoundingClientRect()
     const deltaSeconds = (dx / width) * this.totalDuration
 
+    // During drag, revert to original (un-looped) peaks so buildDisplayPeaks
+    // can tile them correctly for the in-progress duration. The store will
+    // send final pre-looped peaks via setPeaks() on drag end.
+    if (this.peaksPreLooped && this.originalPeaks) {
+      this.peaks = this.originalPeaks
+      this.peaksPreLooped = false
+    }
+
     if (side === 'start') {
       const newStart = this.startTime + deltaSeconds
       const newDuration = this.duration - deltaSeconds
@@ -419,6 +429,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public setPeaks(peaks: number[] | null, preLooped = false) {
     this.peaks = peaks
     this.peaksPreLooped = preLooped
+    if (!preLooped && peaks) {
+      // Save the original un-looped peaks for use during resize drags
+      this.originalPeaks = [...peaks]
+    }
     this.renderWaveform()
   }
 
