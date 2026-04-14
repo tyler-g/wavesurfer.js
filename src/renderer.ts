@@ -187,6 +187,7 @@ class Renderer extends EventEmitter<RendererEvents> {
         :host .scroll {
           overflow-x: auto;
           overflow-y: hidden;
+          overscroll-behavior-x: none;
           width: 100%;
           position: relative;
         }
