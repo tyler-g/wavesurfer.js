@@ -607,6 +607,9 @@ class Renderer extends EventEmitter<RendererEvents> {
     const width = (useParentWidth ? parentWidth : scrollWidth) * pixelRatio
     const totalWidth = width / pixelRatio
 
+    // Preserve scroll position across DOM updates
+    const savedScroll = this.scrollContainer.scrollLeft
+
     // Update wrapper width (DOM write only, no read)
     this.wrapper.style.width = useParentWidth ? '100%' : `${scrollWidth}px`
     this.scrollContainer.style.overflowX = this.isScrollable ? 'auto' : 'hidden'
@@ -740,7 +743,8 @@ class Renderer extends EventEmitter<RendererEvents> {
       }
     }
 
-    // Scrolling is handled by the caller (updatePeaks) after setting cursor position
+    // Restore scroll position in case wrapper width change caused browser clamping
+    this.scrollContainer.scrollLeft = savedScroll
   }
 
   reRender() {

@@ -535,7 +535,11 @@ class WaveSurfer extends Player<WaveSurferEvents> {
         //this.decodedData = this.padAudioBufferToDuration(this.decodedData, 60)
       }
       this.emit('decode', this.getDuration())
+      // Preserve scroll position across render to prevent jitter
+      const savedScroll = this.getScroll()
       this.renderer.render(this.decodedData)
+      this.setScroll(savedScroll)
+      requestAnimationFrame(() => this.setScroll(savedScroll))
     }
 
     this.emit('ready', this.getDuration())
@@ -636,8 +640,14 @@ class WaveSurfer extends Player<WaveSurferEvents> {
 
     ;(media as unknown as WebAudioPlayer).setAudioBuffer(audioBuffer)
 
+    // Preserve scroll position across render to prevent jitter when
+    // recording stops while playback continues
+    const savedScroll = this.getScroll()
     this.decodedData = audioBuffer
     this.renderer.render(this.decodedData)
+    // Restore scroll immediately and again after layout to prevent browser clamping
+    this.setScroll(savedScroll)
+    requestAnimationFrame(() => this.setScroll(savedScroll))
 
     this.emit('decode', this.getDuration())
     this.emit('ready', this.getDuration())
