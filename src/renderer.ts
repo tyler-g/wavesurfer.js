@@ -29,6 +29,8 @@ class Renderer extends EventEmitter<RendererEvents> {
   private isScrollable = false
   private audioData: AudioBuffer | null = null
   private autoScrollSuppressedUntil = 0
+  /** Whether auto-centering has been activated (cursor hit the right edge during playback) */
+  private autoCenterActive = false
   private resizeObserver: ResizeObserver | null = null
   private lastContainerWidth = 0
   private isDragging = false
@@ -802,6 +804,8 @@ class Renderer extends EventEmitter<RendererEvents> {
     // Suppress autoScroll for 300ms so the timer's renderProgress doesn't
     // immediately nudge scrollLeft back toward the playback cursor
     this.autoScrollSuppressedUntil = performance.now() + 300
+    // Reset auto-center since the user changed the viewport
+    this.autoCenterActive = false
   }
 
   private scrollIntoView(progress: number, isPlaying = false) {
@@ -823,14 +827,28 @@ class Renderer extends EventEmitter<RendererEvents> {
         this.scrollContainer.scrollLeft -= minGap
       }
     } else {
-      if (progressWidth < startEdge || progressWidth > endEdge) {
-        this.scrollContainer.scrollLeft = progressWidth - (this.options.autoCenter ? middle : 0)
-      }
-
-      // Keep the cursor centered when playing
-      const center = progressWidth - scrollLeft - middle
-      if (isPlaying && this.options.autoCenter && center > 0) {
-        this.scrollContainer.scrollLeft += Math.min(center, 10)
+      if (isPlaying) {
+        // During playback: only scroll when the cursor reaches the right edge.
+        // Don't scroll when cursor is behind (user scrolled away) or visible.
+        if (progressWidth > endEdge) {
+          // Cursor hit the right edge — jump to show it and activate auto-centering
+          this.autoCenterActive = true
+          this.scrollContainer.scrollLeft = progressWidth - (this.options.autoCenter ? middle : 0)
+        }
+        // Auto-center only after the cursor has hit the right edge at least once
+        if (this.autoCenterActive && this.options.autoCenter) {
+          const center = progressWidth - scrollLeft - middle
+          if (center > 0) {
+            this.scrollContainer.scrollLeft += Math.min(center, 10)
+          }
+        }
+      } else {
+        // Not playing (e.g. seeking): scroll to show cursor if it's offscreen
+        // and reset auto-center activation
+        this.autoCenterActive = false
+        if (progressWidth < startEdge || progressWidth > endEdge) {
+          this.scrollContainer.scrollLeft = progressWidth - (this.options.autoCenter ? middle : 0)
+        }
       }
     }
 
