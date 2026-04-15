@@ -31,6 +31,8 @@ class Renderer extends EventEmitter<RendererEvents> {
   private autoScrollSuppressedUntil = 0
   /** Whether auto-centering has been activated (cursor hit the right edge during playback) */
   private autoCenterActive = false
+  /** Track previous isPlaying state to reset autoCenterActive on play start */
+  private wasPlaying = false
   private resizeObserver: ResizeObserver | null = null
   private lastContainerWidth = 0
   private isDragging = false
@@ -863,6 +865,12 @@ class Renderer extends EventEmitter<RendererEvents> {
 
   renderProgress(progress: number, isPlaying?: boolean, skipScroll?: boolean) {
     if (isNaN(progress)) return
+
+    // Reset auto-center on fresh play start so scrolling doesn't trigger immediately
+    if (isPlaying && !this.wasPlaying) {
+      this.autoCenterActive = false
+    }
+    this.wasPlaying = !!isPlaying
     const percents = progress * 100
     this.canvasWrapper.style.clipPath = `polygon(${percents}% 0%, 100% 0%, 100% 100%, ${percents}% 100%)`
     this.progressWrapper.style.width = `${percents}%`

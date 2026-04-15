@@ -475,7 +475,9 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     this.abortController = null
 
     this.emit('load', url)
-    if (!this.options.media && this.isPlaying()) this.pause()
+    // Don't pause during recording — the RecordPlugin calls load() on the first
+    // frame to set up DOM structure while playback is active
+    if (!this.options.media && this.isPlaying() && !channelData) this.pause()
 
     this.decodedData = null
     this.stopAtPosition = null
@@ -570,14 +572,18 @@ class WaveSurfer extends Player<WaveSurferEvents> {
       const effectiveDuration = Math.max(duration, this.options.projectDuration || 0)
       const progress = Math.min(1, currentTime / effectiveDuration)
 
-      // Scroll to keep cursor centered (direct write — no layout reads needed)
+      // Scroll only when cursor reaches the right edge (matches playback behavior)
       const minPxPerSec = this.options.minPxPerSec || 0
       const scrollWidth = Math.ceil(effectiveDuration * minPxPerSec)
       const clientWidth = this.getWidth()
       if (scrollWidth > clientWidth) {
         const cursorPosition = currentTime * minPxPerSec
-        const targetScroll = cursorPosition - clientWidth / 2
-        this.setScroll(Math.max(0, Math.min(targetScroll, scrollWidth - clientWidth)))
+        const currentScroll = this.getScroll()
+        const rightEdge = currentScroll + clientWidth
+        if (cursorPosition > rightEdge - 50) {
+          const targetScroll = cursorPosition - 50
+          this.setScroll(Math.max(0, Math.min(targetScroll, scrollWidth - clientWidth)))
+        }
       }
 
       // Render the waveform canvases (uses current scrollLeft to determine visible canvases)
