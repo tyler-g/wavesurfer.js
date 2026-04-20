@@ -112,7 +112,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         backgroundColor: this.color,
         borderRadius: '3px',
         boxSizing: 'border-box',
-        border: this.selected ? '2px solid #fff' : '1px solid rgba(255,255,255,0.3)',
+        // Always 2px so toggling selection doesn't shift the inner waveform by 1px
+        border: this.selected ? '2px solid #fff' : '2px solid rgba(255,255,255,0.18)',
         pointerEvents: 'all',
         overflow: 'hidden',
         zIndex: '2',
@@ -402,7 +403,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (this.element) {
       this.element.style.border = selected
         ? '2px solid #fff'
-        : '1px solid rgba(255,255,255,0.3)'
+        : '2px solid rgba(255,255,255,0.18)'
     }
   }
 
