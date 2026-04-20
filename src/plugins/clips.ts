@@ -111,9 +111,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         height: '100%',
         backgroundColor: this.color,
         borderRadius: '3px',
-        boxSizing: 'border-box',
-        // Always 2px so toggling selection doesn't shift the inner waveform by 1px
-        border: this.selected ? '2px solid #fff' : '2px solid rgba(255,255,255,0.18)',
+        // Use outline (not border) so the frame has zero layout impact — no
+        // content-box inset, so the clip's waveform centerline stays on the
+        // track centerline, and toggling selection doesn't shift anything.
+        outline: this.selected ? '2px solid #fff' : '2px solid rgba(255,255,255,0.18)',
+        outlineOffset: '-2px',
         pointerEvents: 'all',
         overflow: 'hidden',
         zIndex: '2',
@@ -401,7 +403,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public setSelected(selected: boolean) {
     this.selected = selected
     if (this.element) {
-      this.element.style.border = selected
+      this.element.style.outline = selected
         ? '2px solid #fff'
         : '2px solid rgba(255,255,255,0.18)'
     }
