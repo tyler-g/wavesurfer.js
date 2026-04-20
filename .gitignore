@@ -10,3 +10,5 @@ cypress/**/__diff_output__/
 .env
 coverage/
 test-results
+# Ignore reference images and screenshots
+*.png
