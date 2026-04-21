@@ -101,6 +101,8 @@ const findSupportedMimeType = () => MIME_TYPES.find((mimeType) => MediaRecorder.
 
 class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private stream: MediaStream | null = null
+  /** True when `stream` was attached via useExternalStream — we must not stop its tracks on stopMic. */
+  private externallyOwnedStream = false
   private source: MediaStreamAudioSourceNode | null = null
   private mediaRecorder: MediaRecorder | null = null
   private dataWindow: Float32Array | null = null
@@ -370,6 +372,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.micStream = micStream
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
     this.stream = stream
+    this.externallyOwnedStream = false
     this.source = micStream.source
 
     return stream
@@ -389,7 +392,38 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     }
 
     this.stream = stream
+    this.externallyOwnedStream = false
     return stream
+  }
+
+  /**
+   * Attach a pre-built MediaStream as the recording source, bypassing the
+   * plugin's internal getUserMedia call. Used when the host app owns the
+   * audio input pipeline (e.g. routing a specific channel off a shared
+   * ChannelSplitter). The caller retains ownership of the stream —
+   * stopMic() will not stop the underlying tracks.
+   *
+   * Call before prewarmMic/startRecording. A subsequent startRecording()
+   * will see this.stream is already set and skip getUserMedia.
+   */
+  public useExternalStream(stream: MediaStream): void {
+    // If there was a previously internally-owned stream, stop its tracks
+    // before attaching the external one — we'd otherwise leak that mic.
+    if (this.stream && !this.externallyOwnedStream) {
+      this.stream.getTracks().forEach((t) => t.stop())
+    }
+    this.micStream?.onDestroy()
+    this.unsubscribeDestroy?.()
+    this.micStream = null
+    this.unsubscribeDestroy = undefined
+    // Discard any MediaRecorder bound to the previous stream. startRecording
+    // caches MediaRecorder and reuses it across recordings, but a recorder
+    // is bound to the MediaStream it was constructed with — once the old
+    // stream's tracks stop, start() throws NotSupportedError. Forcing a
+    // rebuild on the next startRecording call avoids that.
+    this.mediaRecorder = null
+    this.stream = stream
+    this.externallyOwnedStream = true
   }
 
   /** Stop monitoring incoming audio */
@@ -399,8 +433,13 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.micStream = null
     this.unsubscribeDestroy = undefined
     if (!this.stream) return
-    this.stream.getTracks().forEach((track) => track.stop())
+    // Only stop the underlying tracks if we own them. Externally-owned
+    // streams (from input-bus routing) are the caller's to dispose.
+    if (!this.externallyOwnedStream) {
+      this.stream.getTracks().forEach((track) => track.stop())
+    }
     this.stream = null
+    this.externallyOwnedStream = false
     this.source = null
     this.mediaRecorder = null
   }
