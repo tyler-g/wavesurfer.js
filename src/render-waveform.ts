@@ -11,6 +11,14 @@ export type RenderWaveformOptions = {
   barHeight?: number
   barAlign?: 'top' | 'bottom'
   normalize?: boolean
+  /**
+   * Draw a thin horizontal line through the vertical center of each channel
+   * where there is zero/near-zero amplitude. When `false` (default) the
+   * silent regions collapse to empty space instead of a visible midline.
+   * Enable this to restore wavesurfer's historical behavior where every
+   * pixel column renders at least one pixel of "waveform."
+   */
+  showCenterLine?: boolean
 }
 
 function getPixelRatio(): number {
@@ -68,7 +76,18 @@ function renderBarWaveform(
     if (x > prevX) {
       const topBarHeight = Math.round(maxTop * halfHeight * vScale)
       const bottomBarHeight = Math.round(maxBottom * halfHeight * vScale)
-      const barHeight = topBarHeight + bottomBarHeight || 1
+      // `|| 1` forces silent columns to render a 1px-tall bar, producing
+      // a continuous horizontal centerline across silent regions. Gate it
+      // on showCenterLine so callers can opt out (Ableton-style: no
+      // midline in silence).
+      const rawBarHeight = topBarHeight + bottomBarHeight
+      const barHeight = rawBarHeight || (options.showCenterLine ? 1 : 0)
+      if (barHeight === 0) {
+        prevX = x
+        maxTop = 0
+        maxBottom = 0
+        continue
+      }
 
       // Vertical alignment
       let y = halfHeight - topBarHeight
@@ -99,7 +118,13 @@ function renderLineWaveform(
   channelData: Array<Float32Array | number[]>,
   ctx: CanvasRenderingContext2D,
   vScale: number,
+  options: RenderWaveformOptions,
 ) {
+  // `|| 1` on `h` below forces a 1px minimum height for every column, so
+  // even silent audio renders a solid 2px-tall horizontal line at
+  // halfHeight. When showCenterLine is false, fall back to 0 so silent
+  // columns contribute nothing to the fill (Ableton-style).
+  const minH = options.showCenterLine ? 1 : 0
   const drawChannel = (index: number) => {
     const channel = channelData[index] || channelData[0]
     const length = channel.length
@@ -115,7 +140,7 @@ function renderLineWaveform(
       const x = Math.round(i * hScale)
 
       if (x > prevX) {
-        const h = Math.round(max * halfHeight * vScale) || 1
+        const h = Math.round(max * halfHeight * vScale) || minH
         const y = halfHeight + h * (index === 0 ? -1 : 1)
         ctx.lineTo(prevX, y)
         prevX = x
@@ -172,5 +197,5 @@ export function renderWaveform(
   }
 
   // Render waveform as a polyline
-  renderLineWaveform(channelData, ctx, vScale)
+  renderLineWaveform(channelData, ctx, vScale, opts)
 }

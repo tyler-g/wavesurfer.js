@@ -9,7 +9,17 @@ import { makeDraggable } from '../draggable.js'
 import EventEmitter from '../event-emitter.js'
 import createElement from '../dom.js'
 
-export type ClipsPluginOptions = undefined
+export type ClipsPluginOptions =
+  | {
+      /**
+       * Draw a thin horizontal line through the vertical center of each
+       * clip channel in silent regions. Defaults to `false` — silent
+       * audio collapses to empty space (Ableton-style). Set to `true` to
+       * restore a visible midline even when amplitude is zero.
+       */
+      showCenterLine?: boolean
+    }
+  | undefined
 
 export type ClipsPluginEvents = BasePluginEvents & {
   'clip-added': [clip: ClipBlockImpl]

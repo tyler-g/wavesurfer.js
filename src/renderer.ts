@@ -374,6 +374,7 @@ class Renderer extends EventEmitter<RendererEvents> {
       barHeight: options.barHeight,
       barAlign: options.barAlign,
       normalize: options.normalize,
+      showCenterLine: options.showCenterLine,
     })
   }
 

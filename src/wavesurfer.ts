@@ -85,6 +85,10 @@ export type WaveSurferOptions = {
   /** Unified project duration in seconds. When set, scrollable width is based on
    *  max(audioDuration, projectDuration) so all tracks share the same width. */
   projectDuration?: number
+  /** When true, silent regions of the waveform render a 1px-minimum "centerline"
+   *  at the vertical midpoint. Defaults to false (silence collapses to empty
+   *  space). */
+  showCenterLine?: boolean
 }
 
 const defaultOptions = {
