@@ -782,6 +782,21 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
   }
 
+  /** Configure native sample-accurate looping on the underlying audio source.
+   *  Safe to call before or during playback. */
+  public setLoopRegion(start: number, end: number): void {
+    if (this.media instanceof WebAudioPlayer) {
+      ;(this.media as unknown as WebAudioPlayer).setLoopRegion(start, end)
+    }
+  }
+
+  /** Disable native looping; playback continues straight through. */
+  public clearLoopRegion(): void {
+    if (this.media instanceof WebAudioPlayer) {
+      ;(this.media as unknown as WebAudioPlayer).clearLoopRegion()
+    }
+  }
+
   /** Play or pause the audio */
   public async playPause(): Promise<void> {
     return this.isPlaying() ? this.pause() : this.play()
