@@ -20,6 +20,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   private gainNode: GainNode
   private outputNode: AudioNode
   private bufferNode: AudioBufferSourceNode | null = null
+  private loopRegion: { start: number; end: number } | null = null
   private playStartTime = 0
   private playedDuration = 0
   private _muted = false
@@ -100,6 +101,12 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     this.bufferNode.playbackRate.value = this._playbackRate
     this.bufferNode.connect(this.gainNode)
 
+    if (this.loopRegion) {
+      this.bufferNode.loopStart = this.loopRegion.start
+      this.bufferNode.loopEnd = this.loopRegion.end
+      this.bufferNode.loop = true
+    }
+
     let currentPos = this.playedDuration * this._playbackRate
     if (currentPos >= this.duration || currentPos < 0) {
       currentPos = 0
@@ -142,6 +149,12 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     this.bufferNode.playbackRate.value = this._playbackRate
     this.bufferNode.connect(this.gainNode)
 
+    if (this.loopRegion) {
+      this.bufferNode.loopStart = this.loopRegion.start
+      this.bufferNode.loopEnd = this.loopRegion.end
+      this.bufferNode.loop = true
+    }
+
     let currentPos = this.playedDuration * this._playbackRate
     if (currentPos >= this.duration || currentPos < 0) {
       currentPos = 0
@@ -174,6 +187,27 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     this.bufferNode?.stop()
     this.playedDuration += when - this.playStartTime
     this.emit('pause')
+  }
+
+  /** Configure native sample-accurate looping on the underlying AudioBufferSourceNode.
+   *  When set, playback loops between [start, end] seconds in track-time,
+   *  with browser handling the wrap at sample boundary (no JS in the critical path).
+   *  Safe to call while playing — updates the live bufferNode immediately. */
+  setLoopRegion(start: number, end: number) {
+    this.loopRegion = { start, end }
+    if (this.bufferNode) {
+      this.bufferNode.loopStart = start
+      this.bufferNode.loopEnd = end
+      this.bufferNode.loop = true
+    }
+  }
+
+  /** Disable native looping. Playback continues straight through past the former loop end. */
+  clearLoopRegion() {
+    this.loopRegion = null
+    if (this.bufferNode) {
+      this.bufferNode.loop = false
+    }
   }
 
   stopAt(timeSeconds: number) {
@@ -209,10 +243,21 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   }
 
   get currentTime() {
-    const time = this.paused
+    const rawTime = this.paused
       ? this.playedDuration
       : this.playedDuration + (this.audioContext.currentTime - this.playStartTime)
-    return time * this._playbackRate
+    const time = rawTime * this._playbackRate
+    // When native loop is engaged, the audio thread wraps but our
+    // playStartTime/playedDuration don't — wrap the apparent time to match
+    // what the user actually hears so cursor display stays in the loop region.
+    if (this.loopRegion && this.bufferNode?.loop) {
+      const { start, end } = this.loopRegion
+      if (time >= end) {
+        const loopLen = end - start
+        if (loopLen > 0) return start + ((time - start) % loopLen)
+      }
+    }
+    return time
   }
   set currentTime(value) {
     const wasPlaying = !this.paused
