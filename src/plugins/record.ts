@@ -29,6 +29,10 @@ export type RecordPluginOptions = {
   workerContext?: Worker
   /** When true, recording produces standalone clip data instead of stitching into monolithic originalPcm */
   clipMode?: boolean
+  /** Color for the live-recording waveform (wave + progress). Applied when recording starts,
+   *  reverted to the wavesurfer instance's original colors when recording stops. If omitted,
+   *  the wavesurfer instance's own waveColor/progressColor are used unchanged. */
+  recordingWaveColor?: string
 }
 
 export type RecordPluginDeviceOptions = MediaTrackConstraints
@@ -224,6 +228,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       if (this.options.scrollingWaveform) {
         this.wavesurfer.options.cursorWidth = 0
       }
+
+      // Tint the live-recording waveform. originalOptions was just captured above
+      // so applyOriginalOptionsIfNeeded() on record-end/pause restores the pre-
+      // recording colors.
+      this.applyRecordingColorIfNeeded()
     }
 
     const drawWaveform = () => {
@@ -736,6 +745,12 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.mediaRecorder?.resume()
       this.timer.start()
       this.lastStartTime = performance.now()
+      // record-pause cleared originalOptions + restored colors; re-capture
+      // and re-apply the red recording tint for the resumed segment.
+      if (this.wavesurfer) {
+        this.originalOptions ??= { ...this.wavesurfer.options }
+        this.applyRecordingColorIfNeeded()
+      }
       this.emit('record-resume')
     }
   }
@@ -2600,6 +2615,27 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       this.wavesurfer.setOptions(this.originalOptions)
       delete this.originalOptions
     }
+  }
+
+  /** Apply the red-while-recording tint to wave + progress + splitChannels[*] colors.
+   *  Caller must have already captured `originalOptions` so the tint is reverted
+   *  on record-pause / record-end via applyOriginalOptionsIfNeeded(). */
+  private applyRecordingColorIfNeeded() {
+    if (!this.wavesurfer || !this.options.recordingWaveColor) return
+    const recColor = this.options.recordingWaveColor
+    const baseSplit = this.wavesurfer.options.splitChannels
+    const splitOverride = Array.isArray(baseSplit)
+      ? baseSplit.map((entry) => ({
+          ...(entry || {}),
+          waveColor: recColor,
+          progressColor: recColor,
+        }))
+      : baseSplit
+    this.wavesurfer.setOptions({
+      waveColor: recColor,
+      progressColor: recColor,
+      ...(Array.isArray(baseSplit) ? { splitChannels: splitOverride } : {}),
+    })
   }
 }
 
