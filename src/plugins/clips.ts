@@ -202,6 +202,13 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     })
     element.appendChild(label)
 
+    // Dblclick anywhere on the clip body emits the same event. The label's
+    // listener stopPropagation()s so this only fires for dblclicks NOT on the
+    // label, letting consumers disambiguate label vs body by event target.
+    element.addEventListener('dblclick', (e) => {
+      this.emit('dblclick', e)
+    })
+
     // Canvas for waveform
     const canvas = document.createElement('canvas')
     canvas.style.position = 'absolute'
