@@ -78,6 +78,14 @@ export type ClipParams = {
   /** Sample rate the `pcm` was captured at. Required for sample-rate math
    *  in extreme-zoom line rendering. Ignored when `pcm` is absent. */
   sampleRate?: number
+  /** Whether the clip's audio loops a sub-region of the source PCM. When
+   *  true with a positive-length region, the waveform render tiles that
+   *  region across `duration` so the visual matches what's played. */
+  loopEnabled?: boolean
+  /** Start of the loop region in source-PCM seconds. */
+  loopStartSec?: number
+  /** End of the loop region in source-PCM seconds. */
+  loopEndSec?: number
 }
 
 class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
@@ -102,6 +110,12 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   // host app's Float32Array per channel — never mutated here.
   private pcm: Float32Array[] | null
   private sampleRate: number
+  // Loop region — when active, render tiles [loopStartSec, loopEndSec) of
+  // the source PCM across this.duration. Mirrors the audio engine's
+  // `sourceNode.loop` / `loopStart` / `loopEnd` semantics.
+  public loopEnabled: boolean = false
+  public loopStartSec: number = 0
+  public loopEndSec: number = 0
   private rafHandle: number = 0
   /**
    * Snapshot of the inputs that produced the currently-painted canvas.
@@ -123,6 +137,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     canvasWidthCss: number
     startSample: number
     endSample: number
+    loopEnabled: boolean
+    loopStartSec: number
+    loopEndSec: number
   } | null = null
   /** Reference to the owning plugin so the clip can read the shared
    *  visible-time range for viewport culling. */
@@ -145,6 +162,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.data = params.data
     this.pcm = params.pcm ?? null
     this.sampleRate = params.sampleRate ?? 44100
+    this.loopEnabled = params.loopEnabled ?? false
+    this.loopStartSec = params.loopStartSec ?? 0
+    this.loopEndSec = params.loopEndSec ?? 0
     this.totalDuration = Math.max(totalDuration, 0.001)
     this.element = this.initElement()
     this.renderPosition()
@@ -572,6 +592,50 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   }
 
   /**
+   * Shared mono/stereo dispatcher for the PCM render branch. `drawSampleLine`
+   * is called at extreme zoom (samplesPerPixel < 1.5); otherwise `computePeaksCh`
+   * is invoked once per channel and drawn via `drawChannelPeaks`. Returns
+   * true when the canvas was painted, false when nothing was rendered (e.g.
+   * empty PCM channel) so the caller can fall through to the fallback path.
+   */
+  private renderPcmBranch(
+    ctx: CanvasRenderingContext2D,
+    pixelW: number,
+    pixelH: number,
+    samplesPerPixel: number,
+    drawSampleLine: () => void,
+    computePeaksCh: (channelIdx: number) => Float32Array | null,
+  ): boolean {
+    if (!this.pcm || !this.pcm[0]) return false
+
+    if (samplesPerPixel < 1.5) {
+      drawSampleLine()
+      return true
+    }
+
+    const waveColor = 'rgba(255,255,255,0.4)'
+    if (this.pcm.length >= 2 && this.pcm[1]) {
+      const peaksL = computePeaksCh(0)
+      const peaksR = computePeaksCh(1)
+      if (peaksL && peaksR) {
+        const quarterH = pixelH / 4
+        this.drawChannelPeaks(ctx, peaksL, pixelW, quarterH, quarterH, waveColor)
+        this.drawChannelPeaks(ctx, peaksR, pixelW, 3 * quarterH, quarterH, waveColor)
+        return true
+      }
+      return false
+    }
+    const rangePeaks = computePeaksCh(0)
+    if (rangePeaks) {
+      this.drawChannelPeaks(
+        ctx, rangePeaks, pixelW, pixelH / 2, pixelH / 2, waveColor,
+      )
+      return true
+    }
+    return false
+  }
+
+  /**
    * Extreme-zoom sample-line render. Dispatches mono vs stereo layout.
    * Mono: full-canvas polyline centered at pixelH/2. Stereo: two
    * stacked polylines, each centered in its own half — Ableton style.
@@ -602,6 +666,180 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         ctx, this.pcm[0], startSample, endSample, pixelW, halfH, halfH,
       )
     }
+  }
+
+  /**
+   * Tile-aware variant of {@link renderSampleLine} for clips with an active
+   * loop region. Maps each canvas pixel x → clip time → wrapped src time
+   * (`loopStartSec + ((clipTime) mod loopLen)`) → source sample, and draws
+   * a polyline through those samples. At loop wrap points the polyline
+   * starts a new subpath so the visual jump matches the audio engine's
+   * discontinuity rather than smearing samples across the boundary.
+   */
+  private renderSampleLineTiled(
+    ctx: CanvasRenderingContext2D,
+    pixelW: number,
+    pixelH: number,
+    canvasLeftCss: number,
+    canvasWidthCss: number,
+    clipWidthCss: number,
+  ) {
+    if (!this.pcm || !this.pcm[0]) return
+    if (this.pcm.length >= 2 && this.pcm[1]) {
+      const quarterH = pixelH / 4
+      this.drawChannelTiledSampleLine(
+        ctx, this.pcm[0], pixelW, quarterH, quarterH,
+        canvasLeftCss, canvasWidthCss, clipWidthCss,
+      )
+      this.drawChannelTiledSampleLine(
+        ctx, this.pcm[1], pixelW, 3 * quarterH, quarterH,
+        canvasLeftCss, canvasWidthCss, clipWidthCss,
+      )
+    } else {
+      const halfH = pixelH / 2
+      this.drawChannelTiledSampleLine(
+        ctx, this.pcm[0], pixelW, halfH, halfH,
+        canvasLeftCss, canvasWidthCss, clipWidthCss,
+      )
+    }
+  }
+
+  private drawChannelTiledSampleLine(
+    ctx: CanvasRenderingContext2D,
+    channel: Float32Array,
+    pixelW: number,
+    yCenter: number,
+    yHalfHeight: number,
+    canvasLeftCss: number,
+    canvasWidthCss: number,
+    clipWidthCss: number,
+  ) {
+    const loopLen = this.loopEndSec - this.loopStartSec
+    if (loopLen <= 0 || this.sampleRate <= 0) return
+    const sr = this.sampleRate
+    const loopStartSample = Math.max(0, Math.floor(this.loopStartSec * sr))
+    const loopEndSample = Math.min(channel.length, Math.ceil(this.loopEndSec * sr))
+    if (loopEndSample - loopStartSample < 2) return
+
+    const cssPerPixel = canvasWidthCss / Math.max(1, pixelW)
+    const secPerCssPx = this.duration / Math.max(1e-9, clipWidthCss)
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+    ctx.lineWidth = 1
+    ctx.lineJoin = 'round'
+    ctx.beginPath()
+
+    let prevSrcSample = -1
+    let inSubpath = false
+    for (let x = 0; x < pixelW; x++) {
+      const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
+      const clipT = cssPx * secPerCssPx
+      // Positive-modulo: clipT can be slightly negative due to fp on x=0.
+      let tileT = clipT - Math.floor(clipT / loopLen) * loopLen
+      if (tileT < 0) tileT += loopLen
+      const srcSample = loopStartSample + Math.floor(tileT * sr)
+      if (srcSample < 0 || srcSample >= channel.length) {
+        inSubpath = false
+        continue
+      }
+      const s = channel[srcSample]
+      const y = yCenter - s * yHalfHeight
+      // Detect loop wrap (srcSample jumped backward by more than a couple
+      // samples). Start a new subpath so the polyline doesn't draw a
+      // horizontal line across the discontinuity.
+      const wrapped =
+        inSubpath && prevSrcSample >= 0 && srcSample < prevSrcSample - 2
+      if (!inSubpath || wrapped) {
+        ctx.moveTo(x, y)
+        inSubpath = true
+      } else {
+        ctx.lineTo(x, y)
+      }
+      prevSrcSample = srcSample
+    }
+    ctx.stroke()
+
+    // Dots at individual sample positions at extreme zoom.
+    const samplesPerPixel = secPerCssPx * cssPerPixel * sr
+    const pxPerSample = samplesPerPixel > 0 ? 1 / samplesPerPixel : 0
+    if (pxPerSample >= 8) {
+      ctx.fillStyle = 'rgba(255,255,255,0.9)'
+      const dotR = Math.max(1.5, Math.min(3, pxPerSample * 0.18))
+      for (let x = 0; x < pixelW; x++) {
+        const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
+        const clipT = cssPx * secPerCssPx
+        let tileT = clipT - Math.floor(clipT / loopLen) * loopLen
+        if (tileT < 0) tileT += loopLen
+        const srcSample = loopStartSample + Math.floor(tileT * sr)
+        if (srcSample < 0 || srcSample >= channel.length) continue
+        const s = channel[srcSample]
+        const y = yCenter - s * yHalfHeight
+        ctx.beginPath()
+        ctx.arc(x, y, dotR, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    }
+  }
+
+  /**
+   * Tile-aware peak scan for clips with an active loop region. For each
+   * canvas pixel, walks the loop sub-region of the source PCM that the
+   * pixel covers (potentially crossing one or more loop boundaries) and
+   * records max |sample|. Bounded by the same total-samples-in-window
+   * cost as the non-tiled scan — pixels just span shorter src ranges
+   * across more iterations near boundaries.
+   */
+  private computePeaksFromPcmRangeTiled(
+    pixelW: number,
+    canvasLeftCss: number,
+    canvasWidthCss: number,
+    clipWidthCss: number,
+    channelIdx: number,
+  ): Float32Array | null {
+    if (!this.pcm) return null
+    const channel = this.pcm[channelIdx] ?? this.pcm[0]
+    if (!channel) return null
+    const loopLen = this.loopEndSec - this.loopStartSec
+    if (loopLen <= 0 || this.sampleRate <= 0 || pixelW <= 0) return null
+    const sr = this.sampleRate
+    const loopStartSample = Math.max(0, Math.floor(this.loopStartSec * sr))
+    const loopEndSample = Math.min(channel.length, Math.ceil(this.loopEndSec * sr))
+    if (loopEndSample - loopStartSample < 1) return new Float32Array(pixelW)
+
+    const result = new Float32Array(pixelW)
+    const cssPerPixel = canvasWidthCss / pixelW
+    const secPerCssPx = this.duration / Math.max(1e-9, clipWidthCss)
+
+    for (let x = 0; x < pixelW; x++) {
+      const cssL = canvasLeftCss + x * cssPerPixel
+      const cssR = cssL + cssPerPixel
+      const clipTL = cssL * secPerCssPx
+      const clipTR = cssR * secPerCssPx
+      let t = clipTL
+      let maxAbs = 0
+      // Walk one tile segment at a time. Each iteration consumes either
+      // the remainder of the current tile or the rest of the pixel range,
+      // whichever is smaller.
+      while (t < clipTR) {
+        let tileT = t - Math.floor(t / loopLen) * loopLen
+        if (tileT < 0) tileT += loopLen
+        const remInTile = loopLen - tileT
+        const tSegEnd = Math.min(clipTR, t + remInTile)
+        const srcStart = loopStartSample + Math.floor(tileT * sr)
+        const srcEnd = Math.min(
+          loopEndSample,
+          loopStartSample + Math.ceil((tileT + (tSegEnd - t)) * sr),
+        )
+        for (let i = Math.max(loopStartSample, srcStart); i < srcEnd; i++) {
+          const v = channel[i]
+          const abs = v < 0 ? -v : v
+          if (abs > maxAbs) maxAbs = abs
+        }
+        t = tSegEnd
+      }
+      result[x] = maxAbs
+    }
+    return result
   }
 
   public renderWaveform() {
@@ -728,6 +966,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.lastPaintState.canvasWidthCss === canvasWidthCss &&
         this.lastPaintState.startSample === startSample &&
         this.lastPaintState.endSample === endSample &&
+        this.lastPaintState.loopEnabled === this.loopEnabled &&
+        this.lastPaintState.loopStartSec === this.loopStartSec &&
+        this.lastPaintState.loopEndSec === this.loopEndSec &&
         this.canvas.width === pixelW &&
         this.canvas.height === pixelH
       ) {
@@ -757,6 +998,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           peaksPreLooped: this.peaksPreLooped, bins: tierBins,
           duration: this.duration, originalDuration: this.originalDuration,
           canvasLeftCss, canvasWidthCss, startSample, endSample,
+          loopEnabled: this.loopEnabled,
+          loopStartSec: this.loopStartSec,
+          loopEndSec: this.loopEndSec,
         }
       }
 
@@ -775,50 +1019,49 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         return
       }
 
-      // PCM-based rendering. Only kicks in when the clip hasn't been
-      // resized past its original length (peaksPreLooped is the tile
-      // case — we reuse the precomputed looped peaks there because
-      // tiling samples at render time is extra work for a path that
-      // rarely sees extreme zoom anyway).
-      if (this.pcm && this.pcm[0] && this.pcm[0].length > 0 && !this.peaksPreLooped) {
-        const samplesInWindow = endSample - startSample
-        const samplesPerPixel = samplesInWindow / pixelW
+      // PCM-based rendering. Falls through to the precomputed peaks path
+      // only when PCM isn't available, or when the clip was resized past
+      // its original duration without an explicit loop region (the
+      // pre-tiled peaks fallback is still used in that case — making
+      // resize-tile PCM-aware is a separate follow-up).
+      if (this.pcm && this.pcm[0] && this.pcm[0].length > 0) {
+        const loopLen = this.loopEndSec - this.loopStartSec
+        const loopActive =
+          this.loopEnabled && loopLen > 0.0001 && this.sampleRate > 0
 
-        // Sample-accurate line when we have roughly one sample per pixel
-        // or better — Ableton's extreme-zoom view.
-        if (samplesPerPixel < 1.5) {
-          this.renderSampleLine(ctx, pixelW, pixelH, startSample, endSample)
-          persistPaintState()
-          return
-        }
+        if (loopActive) {
+          // Tile-aware: each canvas pixel maps to clip time, wraps modulo
+          // loopLen, then offsets by loopStartSec to read source PCM —
+          // mirrors what the audio engine plays.
+          const canvasTimeSec = (canvasWidthCss / clipWidthCss) * this.duration
+          const samplesPerPixel = (canvasTimeSec / pixelW) * this.sampleRate
 
-        // Otherwise compute peaks for just the samples that fall in the
-        // canvas window, at the canvas's actual pixel width. For stereo
-        // clips, render each channel in its own vertical half with its
-        // own centerline (Ableton layout).
-        const waveColor = 'rgba(255,255,255,0.4)'
-        if (this.pcm.length >= 2 && this.pcm[1]) {
-          const peaksL = this.computePeaksFromPcmRange(
-            startSample, endSample, pixelW, 0,
-          )
-          const peaksR = this.computePeaksFromPcmRange(
-            startSample, endSample, pixelW, 1,
-          )
-          if (peaksL && peaksR) {
-            const quarterH = pixelH / 4
-            this.drawChannelPeaks(ctx, peaksL, pixelW, quarterH, quarterH, waveColor)
-            this.drawChannelPeaks(ctx, peaksR, pixelW, 3 * quarterH, quarterH, waveColor)
+          if (this.renderPcmBranch(
+            ctx, pixelW, pixelH, samplesPerPixel,
+            () => this.renderSampleLineTiled(
+              ctx, pixelW, pixelH,
+              canvasLeftCss, canvasWidthCss, clipWidthCss,
+            ),
+            (idx) => this.computePeaksFromPcmRangeTiled(
+              pixelW, canvasLeftCss, canvasWidthCss, clipWidthCss, idx,
+            ),
+          )) {
             persistPaintState()
             return
           }
-        } else {
-          const rangePeaks = this.computePeaksFromPcmRange(
-            startSample, endSample, pixelW, 0,
-          )
-          if (rangePeaks) {
-            this.drawChannelPeaks(
-              ctx, rangePeaks, pixelW, pixelH / 2, pixelH / 2, waveColor,
-            )
+        } else if (!this.peaksPreLooped) {
+          const samplesInWindow = endSample - startSample
+          const samplesPerPixel = samplesInWindow / pixelW
+
+          if (this.renderPcmBranch(
+            ctx, pixelW, pixelH, samplesPerPixel,
+            () => this.renderSampleLine(
+              ctx, pixelW, pixelH, startSample, endSample,
+            ),
+            (idx) => this.computePeaksFromPcmRange(
+              startSample, endSample, pixelW, idx,
+            ),
+          )) {
             persistPaintState()
             return
           }
@@ -912,6 +1155,29 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (nextRef === prevRef && !sampleRateChanged) return
     this.pcm = pcm
     if (sampleRate != null) this.sampleRate = sampleRate
+    this.lastPaintState = null
+    this.renderWaveform()
+  }
+
+  /**
+   * Mark a loop sub-region of the source PCM for tile-aware rendering.
+   * When enabled with a positive-length region, the PCM render path
+   * tiles `[loopStartSec, loopEndSec)` across the clip's full duration
+   * (matching the audio engine's `sourceNode.loop` semantics) and stays
+   * sample-accurate at extreme zoom. Pass `enabled=false` to render the
+   * PCM linearly.
+   */
+  public setLoopRegion(enabled: boolean, startSec: number, endSec: number) {
+    if (
+      this.loopEnabled === enabled &&
+      this.loopStartSec === startSec &&
+      this.loopEndSec === endSec
+    ) {
+      return
+    }
+    this.loopEnabled = enabled
+    this.loopStartSec = startSec
+    this.loopEndSec = endSec
     this.lastPaintState = null
     this.renderWaveform()
   }
