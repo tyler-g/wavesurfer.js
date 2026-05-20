@@ -683,6 +683,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     canvasLeftCss: number,
     canvasWidthCss: number,
     clipWidthCss: number,
+    loopStartSec: number,
+    loopEndSec: number,
   ) {
     if (!this.pcm || !this.pcm[0]) return
     if (this.pcm.length >= 2 && this.pcm[1]) {
@@ -690,16 +692,19 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[0], pixelW, quarterH, quarterH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
+        loopStartSec, loopEndSec,
       )
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[1], pixelW, 3 * quarterH, quarterH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
+        loopStartSec, loopEndSec,
       )
     } else {
       const halfH = pixelH / 2
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[0], pixelW, halfH, halfH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
+        loopStartSec, loopEndSec,
       )
     }
   }
@@ -713,12 +718,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     canvasLeftCss: number,
     canvasWidthCss: number,
     clipWidthCss: number,
+    loopStartSec: number,
+    loopEndSec: number,
   ) {
-    const loopLen = this.loopEndSec - this.loopStartSec
+    const loopLen = loopEndSec - loopStartSec
     if (loopLen <= 0 || this.sampleRate <= 0) return
     const sr = this.sampleRate
-    const loopStartSample = Math.max(0, Math.floor(this.loopStartSec * sr))
-    const loopEndSample = Math.min(channel.length, Math.ceil(this.loopEndSec * sr))
+    const loopStartSample = Math.max(0, Math.floor(loopStartSec * sr))
+    const loopEndSample = Math.min(channel.length, Math.ceil(loopEndSec * sr))
     if (loopEndSample - loopStartSample < 2) return
 
     const cssPerPixel = canvasWidthCss / Math.max(1, pixelW)
@@ -795,15 +802,17 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     canvasWidthCss: number,
     clipWidthCss: number,
     channelIdx: number,
+    loopStartSec: number,
+    loopEndSec: number,
   ): Float32Array | null {
     if (!this.pcm) return null
     const channel = this.pcm[channelIdx] ?? this.pcm[0]
     if (!channel) return null
-    const loopLen = this.loopEndSec - this.loopStartSec
+    const loopLen = loopEndSec - loopStartSec
     if (loopLen <= 0 || this.sampleRate <= 0 || pixelW <= 0) return null
     const sr = this.sampleRate
-    const loopStartSample = Math.max(0, Math.floor(this.loopStartSec * sr))
-    const loopEndSample = Math.min(channel.length, Math.ceil(this.loopEndSec * sr))
+    const loopStartSample = Math.max(0, Math.floor(loopStartSec * sr))
+    const loopEndSample = Math.min(channel.length, Math.ceil(loopEndSec * sr))
     if (loopEndSample - loopStartSample < 1) return new Float32Array(pixelW)
 
     const result = new Float32Array(pixelW)
@@ -1020,14 +1029,20 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       }
 
       // PCM-based rendering. Falls through to the precomputed peaks path
-      // only when PCM isn't available, or when the clip was resized past
-      // its original duration without an explicit loop region (the
-      // pre-tiled peaks fallback is still used in that case — making
-      // resize-tile PCM-aware is a separate follow-up).
+      // only when PCM isn't available.
       if (this.pcm && this.pcm[0] && this.pcm[0].length > 0) {
         const loopLen = this.loopEndSec - this.loopStartSec
         const loopActive =
           this.loopEnabled && loopLen > 0.0001 && this.sampleRate > 0
+        // Resize-tile: clip was stretched past its original PCM length
+        // without an explicit loop region — tile the whole original PCM.
+        // Equivalent to a loop region of [0, originalDuration].
+        const resizeTile =
+          !loopActive &&
+          !this.peaksPreLooped &&
+          this.sampleRate > 0 &&
+          this.originalDuration > 0.0001 &&
+          this.duration > this.originalDuration + 1e-6
 
         if (loopActive) {
           // Tile-aware: each canvas pixel maps to clip time, wraps modulo
@@ -1041,9 +1056,33 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
             () => this.renderSampleLineTiled(
               ctx, pixelW, pixelH,
               canvasLeftCss, canvasWidthCss, clipWidthCss,
+              this.loopStartSec, this.loopEndSec,
             ),
             (idx) => this.computePeaksFromPcmRangeTiled(
               pixelW, canvasLeftCss, canvasWidthCss, clipWidthCss, idx,
+              this.loopStartSec, this.loopEndSec,
+            ),
+          )) {
+            persistPaintState()
+            return
+          }
+        } else if (resizeTile) {
+          // No explicit loop, but duration exceeds the source PCM — tile
+          // against [0, originalDuration] so the waveform mirrors the
+          // implicit looping done by the resize playback path.
+          const canvasTimeSec = (canvasWidthCss / clipWidthCss) * this.duration
+          const samplesPerPixel = (canvasTimeSec / pixelW) * this.sampleRate
+
+          if (this.renderPcmBranch(
+            ctx, pixelW, pixelH, samplesPerPixel,
+            () => this.renderSampleLineTiled(
+              ctx, pixelW, pixelH,
+              canvasLeftCss, canvasWidthCss, clipWidthCss,
+              0, this.originalDuration,
+            ),
+            (idx) => this.computePeaksFromPcmRangeTiled(
+              pixelW, canvasLeftCss, canvasWidthCss, clipWidthCss, idx,
+              0, this.originalDuration,
             ),
           )) {
             persistPaintState()
