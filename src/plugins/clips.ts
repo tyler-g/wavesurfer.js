@@ -1037,9 +1037,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         // Resize-tile: clip was stretched past its original PCM length
         // without an explicit loop region — tile the whole original PCM.
         // Equivalent to a loop region of [0, originalDuration].
+        // Intentionally ignores peaksPreLooped: the PCM-aware tile render
+        // is sharper than the host's pre-tiled peaks fallback whenever
+        // PCM is available.
         const resizeTile =
           !loopActive &&
-          !this.peaksPreLooped &&
           this.sampleRate > 0 &&
           this.originalDuration > 0.0001 &&
           this.duration > this.originalDuration + 1e-6
