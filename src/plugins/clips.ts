@@ -311,10 +311,24 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.emit('context-menu', e)
     })
 
-    // Track mouse position for cut-line indicator
+    // Track mouse position for cut-line indicator. When the host app has
+    // snap-to-grid enabled, the indicator jumps to the nearest grid line so
+    // the cut cursor reflects where the split will actually land. With snap
+    // off (or no grid), it follows the pointer freely.
     element.addEventListener('mousemove', (e) => {
       const rect = element.getBoundingClientRect()
-      element.style.setProperty('--cut-x', `${e.clientX - rect.left}px`)
+      let offsetPx = e.clientX - rect.left
+      const snap = this.ownerPlugin?.snapConfig
+      if (snap?.enabled && snap.gridSeconds > 0 && rect.width > 0 && this.duration > 0) {
+        // px → absolute time → snapped absolute time → px
+        const absTime = this.startTime + (offsetPx / rect.width) * this.duration
+        const snappedAbs = Math.round(absTime / snap.gridSeconds) * snap.gridSeconds
+        const snappedPx = ((snappedAbs - this.startTime) / this.duration) * rect.width
+        // Keep the indicator within the clip when the nearest grid line lies
+        // outside it (clip narrower than one grid division).
+        offsetPx = Math.max(0, Math.min(rect.width, snappedPx))
+      }
+      element.style.setProperty('--cut-x', `${offsetPx}px`)
     })
 
     // Drag
@@ -1279,6 +1293,16 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
    */
   public visibleStartTime = -Infinity
   public visibleEndTime = Infinity
+  /**
+   * Snap-to-grid config for the cut-tool indicator, pushed in by the host
+   * app. `gridSeconds` is one grid division in seconds (0 = no grid);
+   * `enabled` mirrors the app's snap toggle. When enabled, the cut-line
+   * indicator snaps to grid; otherwise it follows the pointer freely.
+   */
+  public snapConfig: { gridSeconds: number; enabled: boolean } = {
+    gridSeconds: 0,
+    enabled: false,
+  }
   // Cached references to wavesurfer's wrapper (holds the clip container)
   // and its scrolling parent. Clips use these to compute viewport-sized
   // canvas positions instead of canvases that grow with zoom level.
@@ -1431,6 +1455,14 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
   public setTotalDuration(duration: number) {
     this.totalDuration = Math.max(duration, 0.001)
     this.updateAllClipPositions()
+  }
+
+  /**
+   * Push the host app's snap-to-grid state so the cut-tool indicator can
+   * snap to grid lines. `gridSeconds` is one grid division in seconds.
+   */
+  public setSnapConfig(gridSeconds: number, enabled: boolean) {
+    this.snapConfig = { gridSeconds: Math.max(0, gridSeconds), enabled }
   }
 
   private updateAllClipPositions() {
