@@ -1,0 +1,79 @@
+/**
+ * Pure math for mapping a clip canvas window to a PCM sample range.
+ * Lives at src root (NOT src/plugins/ — rollup globs every top-level
+ * plugins file as a default-export-only entry) so the mapping is
+ * unit-testable without breaking the UMD build.
+ */
+
+export type ClipSampleWindowParams = {
+  /** Length of the clip's PCM buffer (samples, one channel). */
+  totalSamples: number
+  /** Clip's current duration in seconds (changes live during a resize drag). */
+  duration: number
+  /** Sample rate of the PCM buffer; <= 0 when unknown. */
+  sampleRate: number
+  /** Full clip element width in CSS px. */
+  clipWidthCss: number
+  /** Canvas window position within the clip, CSS px. */
+  canvasLeftCss: number
+  canvasWidthCss: number
+  /**
+   * Optional drag-stable seconds-per-CSS-px (derived from the parent
+   * timeline width). When provided, the pixel→sample mapping uses it
+   * directly instead of span/clipWidthCss, so a given CSS position maps
+   * to the same sample on every repaint while a resize drag changes the
+   * clip's width — the revealed/cropped edge moves, the rest is still.
+   */
+  secPerCssPx?: number
+}
+
+/**
+ * In steady state the store keeps the PCM sliced to exactly the clip's
+ * duration, so distributing all samples across the clip width is exact.
+ * Mid-resize-drag the store hasn't re-sliced yet: a shrinking clip still
+ * holds the longer buffer, and pure width-based mapping squeezes the whole
+ * waveform into the shrinking width. Capping the span at duration-worth of
+ * samples makes the waveform cut off at the drag edge instead — matching
+ * the start-anchored truncation buildResizedPcm applies on drag end.
+ *
+ * When duration exceeds the buffer (re-extending mid-drag), the cap keeps
+ * the span at the buffer length — same as legacy behavior; the store
+ * materializes the extended audio on drag end.
+ */
+export function computeClipSampleWindow(
+  params: ClipSampleWindowParams,
+): { startSample: number; endSample: number } {
+  const {
+    totalSamples,
+    duration,
+    sampleRate,
+    clipWidthCss,
+    canvasLeftCss,
+    canvasWidthCss,
+    secPerCssPx,
+  } = params
+
+  const durationSamples =
+    sampleRate > 0 && duration > 0
+      ? Math.round(duration * sampleRate)
+      : totalSamples
+  const spanSamples = Math.min(totalSamples, durationSamples)
+  const samplesPerCssPx =
+    secPerCssPx && secPerCssPx > 0 && sampleRate > 0 && spanSamples > 0
+      ? sampleRate * secPerCssPx
+      : spanSamples > 0 && clipWidthCss > 0
+        ? spanSamples / clipWidthCss
+        : 0
+
+  const rawStart = Math.floor(canvasLeftCss * samplesPerCssPx)
+  const rawEnd = Math.ceil((canvasLeftCss + canvasWidthCss) * samplesPerCssPx)
+
+  // Clamp at the duration boundary. The buffer may be LONGER than the
+  // clip (host passes full-length source PCM so extend drags can reveal
+  // a trimmed tail) — samples past duration exist but are outside the
+  // clip and must never paint.
+  return {
+    startSample: Math.max(0, Math.min(rawStart, spanSamples)),
+    endSample: Math.max(0, Math.min(rawEnd, spanSamples)),
+  }
+}

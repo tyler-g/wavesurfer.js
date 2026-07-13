@@ -8,6 +8,7 @@ import BasePlugin, { type BasePluginEvents } from '../base-plugin.js'
 import { makeDraggable } from '../draggable.js'
 import EventEmitter from '../event-emitter.js'
 import createElement from '../dom.js'
+import { computeClipSampleWindow } from '../clip-render-math.js'
 
 export type ClipsPluginOptions =
   | {
@@ -132,6 +133,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     bins: number
     duration: number
     originalDuration: number
+    // Clip element width at paint time — the zoom level. Window reuse
+    // must break when zoom changes: a stale window can hang past the
+    // right edge of a shrinking clip, and the out-of-range tail makes
+    // the repaint stretch (jitter during zoom-out).
+    clipWidthCss: number
     // Canvas window within the clip element, for viewport virtualization.
     canvasLeftCss: number
     canvasWidthCss: number
@@ -380,7 +386,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.startTime = newStart
         this.duration = newDuration
         this.renderPosition()
-        this.renderWaveform()
+        this.repaintForResizeDrag()
         this.emit('update', 'start')
       }
     } else {
@@ -388,10 +394,27 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       if (newDuration > 0.01) {
         this.duration = newDuration
         this.renderPosition()
-        this.renderWaveform()
+        this.repaintForResizeDrag()
         this.emit('update', 'end')
       }
     }
+  }
+
+  /**
+   * Repaint policy for in-progress resize drags. While the duration stays
+   * within what the canvas was last painted with, the painted bitmap is
+   * already pixel-correct at the current zoom — the clip element's
+   * overflow:hidden crops it at the drag edge, so skipping the repaint
+   * keeps the waveform perfectly still. Repainting every mousemove
+   * instead re-derives rounded bitmap/sample geometry from fractional
+   * CSS rects, and the roundings land differently each frame — a visible
+   * sub-pixel tremble. Only a drag past the painted duration (tiling /
+   * stretch content that isn't on the canvas yet) needs live repaints.
+   */
+  private repaintForResizeDrag() {
+    const painted = this.lastPaintState
+    if (painted && this.duration <= painted.duration) return
+    this.renderWaveform()
   }
 
   private onEndResizing(side: 'start' | 'end') {
@@ -461,6 +484,23 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
    *  plugin's scroll handler to decide which clips need a repaint. */
   public isInTimeRange(start: number, end: number): boolean {
     return this.startTime + this.duration > start && this.startTime < end
+  }
+
+  /**
+   * Seconds of clip time per CSS px. Derived from the parent (timeline)
+   * width — constant while a resize drag is in progress — instead of
+   * duration / clipWidthCss: the clip's own measured width is quantized
+   * by layout (1/64 px in Chromium) while duration is a smooth float,
+   * so their ratio wobbles frame to frame and makes live tiled repaints
+   * tremble. Mathematically the two are identical (clip width is
+   * duration/totalDuration of the parent).
+   */
+  private secPerCssPx(clipWidthCss: number): number {
+    const parentW = this.element?.parentElement?.getBoundingClientRect().width
+    if (parentW && parentW > 0 && this.totalDuration > 0) {
+      return this.totalDuration / parentW
+    }
+    return this.duration / Math.max(1e-9, clipWidthCss)
   }
 
   /** True if the clip is inside the wavesurfer's current visible range.
@@ -743,7 +783,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (loopEndSample - loopStartSample < 2) return
 
     const cssPerPixel = canvasWidthCss / Math.max(1, pixelW)
-    const secPerCssPx = this.duration / Math.max(1e-9, clipWidthCss)
+    const secPerCssPx = this.secPerCssPx(clipWidthCss)
 
     ctx.strokeStyle = 'rgba(255,255,255,0.85)'
     ctx.lineWidth = 1
@@ -831,7 +871,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
     const result = new Float32Array(pixelW)
     const cssPerPixel = canvasWidthCss / pixelW
-    const secPerCssPx = this.duration / Math.max(1e-9, clipWidthCss)
+    const secPerCssPx = this.secPerCssPx(clipWidthCss)
 
     for (let x = 0; x < pixelW; x++) {
       const cssL = canvasLeftCss + x * cssPerPixel
@@ -927,6 +967,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         const last = this.lastPaintState
         const sameZoomAndData =
           last &&
+          last.clipWidthCss === clipWidthCss &&
           last.duration === this.duration &&
           last.originalDuration === this.originalDuration &&
           last.pcmRef === (this.pcm?.[0] ?? null) &&
@@ -958,22 +999,54 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       if (canvasWidthCss <= 0) return
 
       const dpr = Math.max(1, window.devicePixelRatio || 1)
+      // Quantize the canvas window to whole device pixels. With a
+      // fractional window, the bitmap→CSS scale (pixelW vs. CSS width)
+      // rounds to a slightly different value on every repaint — during
+      // a live resize drag that reads as the waveform trembling.
+      // Quantized, the scale is exactly 1/dpr on every frame.
+      canvasLeftCss = Math.round(canvasLeftCss * dpr) / dpr
+      canvasWidthCss = Math.round(canvasWidthCss * dpr) / dpr
+      if (canvasWidthCss <= 0) return
+
       const pixelW = Math.max(1, Math.round(canvasWidthCss * dpr))
       const pixelH = Math.max(1, Math.round(cssH * dpr))
 
       // Sample range that maps to this canvas window within the clip.
-      // Derived from the clip's CSS width, so it's independent of any
-      // internal sample-rate / duration fields drifting from reality.
+      // The span is capped at duration-worth of samples so a shrink drag
+      // cuts the waveform off at the drag edge instead of squishing the
+      // full buffer into the shrinking width (the store only re-slices
+      // PCM on drag end) — see computeClipSampleWindow.
       const totalSamples = this.pcm?.[0]?.length ?? 0
-      const samplesPerCssPx = totalSamples > 0 ? totalSamples / clipWidthCss : 0
-      const startSample = Math.floor(canvasLeftCss * samplesPerCssPx)
-      const endSample = Math.ceil((canvasLeftCss + canvasWidthCss) * samplesPerCssPx)
+      const stableSecPerCssPx = this.secPerCssPx(clipWidthCss)
+      const { startSample, endSample } = computeClipSampleWindow({
+        totalSamples,
+        duration: this.duration,
+        sampleRate: this.sampleRate,
+        clipWidthCss,
+        canvasLeftCss,
+        canvasWidthCss,
+        secPerCssPx: stableSecPerCssPx,
+      })
+
+      // peaksPreLooped forces the precomputed-peaks fallback only when the
+      // PCM can't represent the clip on its own (it's the un-tiled
+      // original, shorter than the clip). When the PCM already spans the
+      // clip's duration — the host re-slices PCM on resize end — the plain
+      // range render is equally correct and far sharper than the host's
+      // low-bin peaks (a shrunk clip otherwise visibly degrades the moment
+      // a resize drag commits).
+      const pcmSpansClip =
+        this.sampleRate > 0 &&
+        totalSamples / this.sampleRate >= this.duration - 0.001
 
       // Short-circuit when nothing material changed since the last paint.
       // Canvas position + sample range are part of the key so a scroll
       // or zoom that shifts the window forces a repaint.
       const pcmRef = this.pcm?.[0] ?? null
-      const tierBins = this.pcm && !this.peaksPreLooped ? this.tierForBins(pixelW) : 0
+      const tierBins =
+        this.pcm && (!this.peaksPreLooped || pcmSpansClip)
+          ? this.tierForBins(pixelW)
+          : 0
       if (
         !this.renderContent &&
         this.lastPaintState &&
@@ -1020,7 +1093,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           pixelW, pixelH, pcmRef, peaksRef: this.peaks,
           peaksPreLooped: this.peaksPreLooped, bins: tierBins,
           duration: this.duration, originalDuration: this.originalDuration,
-          canvasLeftCss, canvasWidthCss, startSample, endSample,
+          clipWidthCss, canvasLeftCss, canvasWidthCss, startSample, endSample,
           loopEnabled: this.loopEnabled,
           loopStartSec: this.loopStartSec,
           loopEndSec: this.loopEndSec,
@@ -1064,8 +1137,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           // Tile-aware: each canvas pixel maps to clip time, wraps modulo
           // loopLen, then offsets by loopStartSec to read source PCM —
           // mirrors what the audio engine plays.
-          const canvasTimeSec = (canvasWidthCss / clipWidthCss) * this.duration
-          const samplesPerPixel = (canvasTimeSec / pixelW) * this.sampleRate
+          const samplesPerPixel =
+            stableSecPerCssPx * (canvasWidthCss / pixelW) * this.sampleRate
 
           if (this.renderPcmBranch(
             ctx, pixelW, pixelH, samplesPerPixel,
@@ -1086,8 +1159,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           // No explicit loop, but duration exceeds the source PCM — tile
           // against [0, originalDuration] so the waveform mirrors the
           // implicit looping done by the resize playback path.
-          const canvasTimeSec = (canvasWidthCss / clipWidthCss) * this.duration
-          const samplesPerPixel = (canvasTimeSec / pixelW) * this.sampleRate
+          const samplesPerPixel =
+            stableSecPerCssPx * (canvasWidthCss / pixelW) * this.sampleRate
 
           if (this.renderPcmBranch(
             ctx, pixelW, pixelH, samplesPerPixel,
@@ -1104,7 +1177,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
             persistPaintState()
             return
           }
-        } else if (!this.peaksPreLooped) {
+        } else if (!this.peaksPreLooped || pcmSpansClip) {
           const samplesInWindow = endSample - startSample
           const samplesPerPixel = samplesInWindow / pixelW
 
