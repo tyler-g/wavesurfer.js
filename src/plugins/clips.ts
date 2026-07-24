@@ -87,6 +87,12 @@ export type ClipParams = {
   loopStartSec?: number
   /** End of the loop region in source-PCM seconds. */
   loopEndSec?: number
+  /** Phase offset (source-PCM seconds) folded into the tile time before
+   *  wrapping into the loop region. Lets a growing/mid-capture clip's
+   *  tile origin track the live source position instead of always
+   *  starting the tile at `loopStartSec`. Defaults to 0, which reduces
+   *  every phase-aware expression to today's phase-less behavior. */
+  loopPhaseSec?: number
 }
 
 class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
@@ -117,6 +123,16 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public loopEnabled: boolean = false
   public loopStartSec: number = 0
   public loopEndSec: number = 0
+  public loopPhaseSec: number = 0
+  /** Cumulative left-edge movement (seconds; positive = extended left) of
+   *  the CURRENT resize drag. Read by paintPhaseSec (and by custom content
+   *  renderers via the block reference) to keep painted content anchored to
+   *  the timeline mid-drag. Reset in onEndResizing. */
+  public resizeStartDeltaSec = 0
+  /** Duration when the current resize drag began (null = no drag). */
+  private dragStartDuration: number | null = null
+  /** Source-domain extent bound for trim-mode clamps, captured per drag. */
+  private dragStartExtent = 0
   private rafHandle: number = 0
   /**
    * Snapshot of the inputs that produced the currently-painted canvas.
@@ -146,6 +162,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     loopEnabled: boolean
     loopStartSec: number
     loopEndSec: number
+    loopPhaseSec: number
   } | null = null
   /** Reference to the owning plugin so the clip can read the shared
    *  visible-time range for viewport culling. */
@@ -171,6 +188,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.loopEnabled = params.loopEnabled ?? false
     this.loopStartSec = params.loopStartSec ?? 0
     this.loopEndSec = params.loopEndSec ?? 0
+    this.loopPhaseSec = params.loopPhaseSec ?? 0
     this.totalDuration = Math.max(totalDuration, 0.001)
     this.element = this.initElement()
     this.renderPosition()
@@ -369,7 +387,33 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   private onResize(dx: number, side: 'start' | 'end') {
     if (!this.element?.parentElement) return
     const { width } = this.element.parentElement.getBoundingClientRect()
-    const deltaSeconds = (dx / width) * this.totalDuration
+    let deltaSeconds = (dx / width) * this.totalDuration
+
+    // Capture per-drag anchors on the first move. dragStartExtent is the
+    // source-domain bound for trim-mode clamps: normally the source content
+    // length, but never less than the clip's current window so legacy
+    // over-stretched clips can shrink without a jarring snap (they just
+    // can't grow further).
+    if (this.dragStartDuration === null) {
+      this.dragStartDuration = this.duration
+      this.dragStartExtent = Math.max(
+        this.originalDuration || 0,
+        (this.loopPhaseSec ?? 0) + this.duration,
+      )
+    }
+
+    // Trim mode (no loop tiling): edges are bounded by the source content —
+    // the left edge stops when the source-start offset reaches 0, the right
+    // edge when offset + duration reaches the source extent. Loop-enabled
+    // clips extend freely (tiling). Session-bounced clips are loop-enabled;
+    // directly-recorded clips are not — this is what makes them trim-only.
+    // A degenerate loop region (loopEndSec <= loopStartSec) must NOT count
+    // as "loop tiling" — matches the engine's loopIsActive predicate
+    // (arrangement-engine.ts) so the fork and engine agree on which clips
+    // are trim-mode.
+    const trimMode =
+      !(this.loopEnabled && this.loopEndSec - this.loopStartSec > 0.0001) &&
+      (this.originalDuration || 0) > 0.0001
 
     // During drag, revert to original (un-looped) peaks so buildDisplayPeaks
     // can tile them correctly for the in-progress duration. The store will
@@ -380,21 +424,40 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     }
 
     if (side === 'start') {
-      const newStart = this.startTime + deltaSeconds
-      const newDuration = this.duration - deltaSeconds
+      let newStart = this.startTime + deltaSeconds
+      let newDuration = this.duration - deltaSeconds
+      if (trimMode) {
+        // Left edge cannot reveal earlier than the source start (offset 0).
+        const nextAccum = this.resizeStartDeltaSec - deltaSeconds
+        const newOffset = (this.loopPhaseSec ?? 0) - nextAccum
+        if (newOffset < 0) {
+          const excess = -newOffset
+          newStart += excess
+          newDuration -= excess
+          deltaSeconds += excess
+        }
+      }
       if (newStart >= 0 && newDuration > 0.01) {
         this.startTime = newStart
         this.duration = newDuration
+        // Track cumulative left-edge movement (positive = extended left) so
+        // painting can keep content timeline-anchored mid-drag.
+        this.resizeStartDeltaSec -= deltaSeconds
         this.renderPosition()
-        this.repaintForResizeDrag()
+        this.repaintForResizeDrag('start')
         this.emit('update', 'start')
       }
     } else {
-      const newDuration = this.duration + deltaSeconds
-      if (newDuration > 0.01) {
+      let newDuration = this.duration + deltaSeconds
+      if (trimMode) {
+        const offset = (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec
+        const maxDur = this.dragStartExtent - offset
+        if (newDuration > maxDur) newDuration = maxDur
+      }
+      if (newDuration > 0.01 && newDuration !== this.duration) {
         this.duration = newDuration
         this.renderPosition()
-        this.repaintForResizeDrag()
+        this.repaintForResizeDrag('end')
         this.emit('update', 'end')
       }
     }
@@ -411,14 +474,39 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
    * sub-pixel tremble. Only a drag past the painted duration (tiling /
    * stretch content that isn't on the canvas yet) needs live repaints.
    */
-  private repaintForResizeDrag() {
-    const painted = this.lastPaintState
-    if (painted && this.duration <= painted.duration) return
+  private repaintForResizeDrag(side: 'start' | 'end') {
+    // Left-edge drags move the element origin: the painted bitmap rides the
+    // edge, so content must repaint (with drag phase compensation via
+    // paintPhaseSec) to stay timeline-anchored. Right-edge shrink keeps the
+    // origin — the frozen bitmap crops correctly at the drag edge.
+    if (side === 'end') {
+      const painted = this.lastPaintState
+      if (painted && this.duration <= painted.duration) return
+    }
     this.renderWaveform()
   }
 
   private onEndResizing(side: 'start' | 'end') {
+    // Clear drag-transient state BEFORE emitting: the host commits the
+    // authoritative startTime/duration/phase in response, and its sync
+    // repaint must not be double-compensated.
+    this.resizeStartDeltaSec = 0
+    this.dragStartDuration = null
+    this.dragStartExtent = 0
     this.emit('update-end', side)
+  }
+
+  /**
+   * Effective loop phase for PAINTING: the committed loopPhaseSec minus the
+   * cumulative left-edge movement of an in-progress resize drag, so tiled
+   * content stays anchored to the timeline while the edge moves. Forward-clip
+   * rule only — the plugin doesn't know `reversed`; reversed clips settle to
+   * the exact committed phase on release.
+   */
+  private paintPhaseSec(loopLen: number): number {
+    if (!(loopLen > 0)) return 0
+    const raw = (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec
+    return ((raw % loopLen) + loopLen) % loopLen
   }
 
   public renderPosition() {
@@ -432,6 +520,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   /**
    * Build display peaks that correctly represent looped or truncated audio.
    * When duration > originalDuration, tiles the peaks. When smaller, truncates.
+   *
+   * NOTE: phase-less fallback — has no loop-region model; the store's
+   * pre-looped peaks (which honor loopPhaseSec) replace this within a
+   * frame. Mid-drag retiles briefly render phase-0.
    */
   private buildDisplayPeaks(peaks: number[], numBins: number): number[] {
     const origDur = this.originalDuration
@@ -739,6 +831,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     clipWidthCss: number,
     loopStartSec: number,
     loopEndSec: number,
+    loopPhaseSec: number,
   ) {
     if (!this.pcm || !this.pcm[0]) return
     if (this.pcm.length >= 2 && this.pcm[1]) {
@@ -746,19 +839,19 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[0], pixelW, quarterH, quarterH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
-        loopStartSec, loopEndSec,
+        loopStartSec, loopEndSec, loopPhaseSec,
       )
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[1], pixelW, 3 * quarterH, quarterH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
-        loopStartSec, loopEndSec,
+        loopStartSec, loopEndSec, loopPhaseSec,
       )
     } else {
       const halfH = pixelH / 2
       this.drawChannelTiledSampleLine(
         ctx, this.pcm[0], pixelW, halfH, halfH,
         canvasLeftCss, canvasWidthCss, clipWidthCss,
-        loopStartSec, loopEndSec,
+        loopStartSec, loopEndSec, loopPhaseSec,
       )
     }
   }
@@ -774,6 +867,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     clipWidthCss: number,
     loopStartSec: number,
     loopEndSec: number,
+    loopPhaseSec: number,
   ) {
     const loopLen = loopEndSec - loopStartSec
     if (loopLen <= 0 || this.sampleRate <= 0) return
@@ -795,8 +889,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     for (let x = 0; x < pixelW; x++) {
       const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
       const clipT = cssPx * secPerCssPx
-      // Positive-modulo: clipT can be slightly negative due to fp on x=0.
-      let tileT = clipT - Math.floor(clipT / loopLen) * loopLen
+      // Fold the loop phase into the tile time before wrapping — at
+      // phase 0 this reduces to the original expression exactly.
+      const shifted = clipT + loopPhaseSec
+      // Positive-modulo: shifted can be negative (phase offset, or fp on x=0).
+      let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
       if (tileT < 0) tileT += loopLen
       const srcSample = loopStartSample + Math.floor(tileT * sr)
       if (srcSample < 0 || srcSample >= channel.length) {
@@ -829,7 +926,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       for (let x = 0; x < pixelW; x++) {
         const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
         const clipT = cssPx * secPerCssPx
-        let tileT = clipT - Math.floor(clipT / loopLen) * loopLen
+        const shifted = clipT + loopPhaseSec
+        let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
         if (tileT < 0) tileT += loopLen
         const srcSample = loopStartSample + Math.floor(tileT * sr)
         if (srcSample < 0 || srcSample >= channel.length) continue
@@ -858,6 +956,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     channelIdx: number,
     loopStartSec: number,
     loopEndSec: number,
+    loopPhaseSec: number,
   ): Float32Array | null {
     if (!this.pcm) return null
     const channel = this.pcm[channelIdx] ?? this.pcm[0]
@@ -884,7 +983,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // the remainder of the current tile or the rest of the pixel range,
       // whichever is smaller.
       while (t < clipTR) {
-        let tileT = t - Math.floor(t / loopLen) * loopLen
+        const shifted = t + loopPhaseSec
+        let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
         if (tileT < 0) tileT += loopLen
         const remInTile = loopLen - tileT
         const tSegEnd = Math.min(clipTR, t + remInTile)
@@ -1022,6 +1122,23 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         totalSamples,
         duration: this.duration,
         sampleRate: this.sampleRate,
+        // Non-loop trim: loopPhaseSec doubles as the source-start offset;
+        // compensate live for an in-progress left-edge drag so content
+        // stays timeline-anchored (loop clips handle phase in the tiled
+        // branches via paintPhaseSec instead). Same degenerate-loop-region
+        // predicate as trimMode above — keep the two gates in agreement.
+        // NOTE: this fork has no concept of `reversed` — for a reversed
+        // clip the store computes the live offset from the RIGHT edge, not
+        // the left (see ClipSlice.tsx resizeClip), so this left-edge-only
+        // compensation under-/over-shoots during an in-progress drag on a
+        // reversed clip. The mid-drag preview is therefore
+        // phase-uncompensated for reversed clips; it settles to the
+        // correct window once the store's authoritative resizeClip commits
+        // on drag release.
+        sourceOffsetSec:
+          this.loopEnabled && this.loopEndSec - this.loopStartSec > 0.0001
+            ? 0
+            : Math.max(0, (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec),
         clipWidthCss,
         canvasLeftCss,
         canvasWidthCss,
@@ -1065,6 +1182,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.lastPaintState.loopEnabled === this.loopEnabled &&
         this.lastPaintState.loopStartSec === this.loopStartSec &&
         this.lastPaintState.loopEndSec === this.loopEndSec &&
+        this.lastPaintState.loopPhaseSec === this.loopPhaseSec &&
         this.canvas.width === pixelW &&
         this.canvas.height === pixelH
       ) {
@@ -1097,6 +1215,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           loopEnabled: this.loopEnabled,
           loopStartSec: this.loopStartSec,
           loopEndSec: this.loopEndSec,
+          loopPhaseSec: this.loopPhaseSec,
         }
       }
 
@@ -1105,10 +1224,25 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // are computed against clip coordinates — windowing would require
       // a protocol update for the render callback.
       if (this.renderContent) {
-        // Restore full-width for custom renderers.
+        // Drag-stable geometry: derive the content width from the parent's
+        // px/sec (constant during a resize drag) rather than the
+        // layout-quantized element width, and pin the canvas CSS size 1:1
+        // to the bitmap. With `width: 100%` the bitmap rescaled against the
+        // moving element every frame — a ±1px rounding of the backing store
+        // rescaled the whole painting, the subtle note-shimmer seen while
+        // dragging MIDI clip edges. Overflow past the element is cropped by
+        // the clip's `overflow: hidden`.
+        const contentParent = clipEl.parentElement
+        const parentW = contentParent
+          ? contentParent.getBoundingClientRect().width
+          : clipWidthCss
+        const pxPerSecStable =
+          this.totalDuration > 0 ? parentW / this.totalDuration : 0
+        const contentWidthCss =
+          pxPerSecStable > 0 ? this.duration * pxPerSecStable : clipWidthCss
+        const fullPixelW = Math.max(1, Math.round(contentWidthCss * dpr))
         this.canvas.style.left = '0'
-        this.canvas.style.width = '100%'
-        const fullPixelW = Math.max(1, Math.round(clipWidthCss * dpr))
+        this.canvas.style.width = `${fullPixelW / dpr}px`
         if (this.canvas.width !== fullPixelW) this.canvas.width = fullPixelW
         ctx.clearRect(0, 0, fullPixelW, pixelH)
         this.renderContent(ctx, fullPixelW, pixelH, this)
@@ -1145,11 +1279,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
             () => this.renderSampleLineTiled(
               ctx, pixelW, pixelH,
               canvasLeftCss, canvasWidthCss, clipWidthCss,
-              this.loopStartSec, this.loopEndSec,
+              this.loopStartSec, this.loopEndSec, this.paintPhaseSec(loopLen),
             ),
             (idx) => this.computePeaksFromPcmRangeTiled(
               pixelW, canvasLeftCss, canvasWidthCss, clipWidthCss, idx,
-              this.loopStartSec, this.loopEndSec,
+              this.loopStartSec, this.loopEndSec, this.paintPhaseSec(loopLen),
             ),
           )) {
             persistPaintState()
@@ -1167,11 +1301,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
             () => this.renderSampleLineTiled(
               ctx, pixelW, pixelH,
               canvasLeftCss, canvasWidthCss, clipWidthCss,
-              0, this.originalDuration,
+              0, this.originalDuration, 0,
             ),
             (idx) => this.computePeaksFromPcmRangeTiled(
               pixelW, canvasLeftCss, canvasWidthCss, clipWidthCss, idx,
-              0, this.originalDuration,
+              0, this.originalDuration, 0,
             ),
           )) {
             persistPaintState()
@@ -1295,17 +1429,24 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
    * sample-accurate at extreme zoom. Pass `enabled=false` to render the
    * PCM linearly.
    */
-  public setLoopRegion(enabled: boolean, startSec: number, endSec: number) {
+  public setLoopRegion(
+    enabled: boolean,
+    startSec: number,
+    endSec: number,
+    phaseSec: number = 0,
+  ) {
     if (
       this.loopEnabled === enabled &&
       this.loopStartSec === startSec &&
-      this.loopEndSec === endSec
+      this.loopEndSec === endSec &&
+      this.loopPhaseSec === phaseSec
     ) {
       return
     }
     this.loopEnabled = enabled
     this.loopStartSec = startSec
     this.loopEndSec = endSec
+    this.loopPhaseSec = phaseSec
     this.lastPaintState = null
     this.renderWaveform()
   }

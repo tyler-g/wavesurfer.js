@@ -124,6 +124,63 @@ describe('computeClipSampleWindow', () => {
     expect(at4s.endSample).toBe(at3s.endSample)
   })
 
+  test('sourceOffsetSec: 0 (or omitted) behaves identically to the no-offset call', () => {
+    const totalSamples = 5 * sr
+    const base = {
+      totalSamples,
+      duration: 3,
+      sampleRate: sr,
+      clipWidthCss: 600,
+      canvasLeftCss: 100,
+      canvasWidthCss: 300,
+    }
+    const withoutOffset = computeClipSampleWindow(base)
+    const withZeroOffset = computeClipSampleWindow({ ...base, sourceOffsetSec: 0 })
+    expect(withZeroOffset).toEqual(withoutOffset)
+  })
+
+  test('sourceOffsetSec shifts start/end by offsetSamples; full clip width reaches endBound = offset + span', () => {
+    // 10s buffer, but the clip is a 3s trim starting 2s into the source
+    // (non-loop trim mode — loopPhaseSec doubles as this offset). The full
+    // clip width must map to exactly [offset, offset + span) of the buffer.
+    const totalSamples = 10 * sr
+    const offsetSec = 2
+    const { startSample, endSample } = computeClipSampleWindow({
+      totalSamples,
+      duration: 3,
+      sampleRate: sr,
+      clipWidthCss: 600,
+      canvasLeftCss: 0,
+      canvasWidthCss: 600,
+      sourceOffsetSec: offsetSec,
+    })
+    const offsetSamples = offsetSec * sr
+    expect(startSample).toBe(offsetSamples)
+    expect(endSample).toBe(offsetSamples + 3 * sr) // endBound = offset + span
+  })
+
+  test('sourceOffsetSec: window clamps at offset + duration when the buffer extends further', () => {
+    // Buffer holds far more than the trimmed window (10s), and the canvas
+    // window is wider than the clip (mirrors the "full-length PCM + shrunk
+    // clip" clamp test above). The trimmed tail beyond offset + duration
+    // must never paint, regardless of how much more buffer exists.
+    const totalSamples = 10 * sr
+    const offsetSec = 2
+    const secPerCssPx = 3 / 600 // 3s clip over 600 CSS px
+    const { startSample, endSample } = computeClipSampleWindow({
+      totalSamples,
+      duration: 3,
+      sampleRate: sr,
+      clipWidthCss: 600,
+      canvasLeftCss: 0,
+      canvasWidthCss: 610, // extends past the clip edge
+      secPerCssPx,
+      sourceOffsetSec: offsetSec,
+    })
+    expect(startSample).toBe(offsetSec * sr)
+    expect(endSample).toBe((offsetSec + 3) * sr)
+  })
+
   test('degenerate inputs produce an empty window', () => {
     expect(
       computeClipSampleWindow({

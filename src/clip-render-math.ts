@@ -25,6 +25,12 @@ export type ClipSampleWindowParams = {
    * clip's width — the revealed/cropped edge moves, the rest is still.
    */
   secPerCssPx?: number
+  /**
+   * Source-start offset in seconds (non-loop trim: the clip's left edge
+   * corresponds to this position in the source PCM, not sample 0). The
+   * whole canvas window shifts by this amount into the buffer.
+   */
+  sourceOffsetSec?: number
 }
 
 /**
@@ -51,13 +57,19 @@ export function computeClipSampleWindow(
     canvasLeftCss,
     canvasWidthCss,
     secPerCssPx,
+    sourceOffsetSec,
   } = params
 
+  const offsetSamples =
+    sampleRate > 0 && sourceOffsetSec && sourceOffsetSec > 0
+      ? Math.round(sourceOffsetSec * sampleRate)
+      : 0
+  const availableSamples = Math.max(0, totalSamples - offsetSamples)
   const durationSamples =
     sampleRate > 0 && duration > 0
       ? Math.round(duration * sampleRate)
-      : totalSamples
-  const spanSamples = Math.min(totalSamples, durationSamples)
+      : availableSamples
+  const spanSamples = Math.min(availableSamples, durationSamples)
   const samplesPerCssPx =
     secPerCssPx && secPerCssPx > 0 && sampleRate > 0 && spanSamples > 0
       ? sampleRate * secPerCssPx
@@ -65,15 +77,19 @@ export function computeClipSampleWindow(
         ? spanSamples / clipWidthCss
         : 0
 
-  const rawStart = Math.floor(canvasLeftCss * samplesPerCssPx)
-  const rawEnd = Math.ceil((canvasLeftCss + canvasWidthCss) * samplesPerCssPx)
+  const rawStart = Math.floor(canvasLeftCss * samplesPerCssPx) + offsetSamples
+  const rawEnd =
+    Math.ceil((canvasLeftCss + canvasWidthCss) * samplesPerCssPx) +
+    offsetSamples
 
-  // Clamp at the duration boundary. The buffer may be LONGER than the
-  // clip (host passes full-length source PCM so extend drags can reveal
-  // a trimmed tail) — samples past duration exist but are outside the
-  // clip and must never paint.
+  // Clamp at the content-window boundary. The buffer may be LONGER than
+  // the clip (host passes full-length source PCM so extend drags can
+  // reveal trimmed content on either side) — samples outside
+  // [offset, offset + duration] exist but are outside the clip and must
+  // never paint.
+  const endBound = offsetSamples + spanSamples
   return {
-    startSample: Math.max(0, Math.min(rawStart, spanSamples)),
-    endSample: Math.max(0, Math.min(rawEnd, spanSamples)),
+    startSample: Math.max(0, Math.min(rawStart, endBound)),
+    endSample: Math.max(0, Math.min(rawEnd, endBound)),
   }
 }
