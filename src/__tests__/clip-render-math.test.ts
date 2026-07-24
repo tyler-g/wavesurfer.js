@@ -1,4 +1,7 @@
-import { computeClipSampleWindow } from '../clip-render-math.js'
+import {
+  computeClipSampleWindow,
+  computeContentPixelWidth,
+} from '../clip-render-math.js'
 
 describe('computeClipSampleWindow', () => {
   const sr = 44100
@@ -202,5 +205,50 @@ describe('computeClipSampleWindow', () => {
         canvasWidthCss: 0,
       }),
     ).toEqual({ startSample: 0, endSample: 0 })
+  })
+})
+
+describe('computeContentPixelWidth', () => {
+  test('content width is UNROUNDED so the time→pixel scale is drag-stable', () => {
+    // Simulate a resize drag: duration sweeps continuously. A note at a
+    // fixed time inside the clip must land on the same pixel every frame:
+    // x = (tSec / duration) * contentW must be exactly tSec * pxPerSec * dpr.
+    const parentWidthCss = 8000
+    const totalDuration = 60
+    const dpr = 2
+    const pxPerSec = parentWidthCss / totalDuration
+    const tSec = 3.123
+    for (let duration = 4; duration < 6; duration += 0.0137) {
+      const { contentW } = computeContentPixelWidth({
+        duration,
+        parentWidthCss,
+        totalDuration,
+        dpr,
+      })
+      const x = (tSec / duration) * contentW
+      expect(x).toBeCloseTo(tSec * pxPerSec * dpr, 6)
+    }
+  })
+
+  test('bitmap width is the rounded content width (min 1)', () => {
+    const { contentW, bitmapW } = computeContentPixelWidth({
+      duration: 4.567,
+      parentWidthCss: 1000,
+      totalDuration: 60,
+      dpr: 2,
+    })
+    expect(bitmapW).toBe(Math.max(1, Math.round(contentW)))
+  })
+
+  test('degenerate total duration falls back to the clip CSS width', () => {
+    const { contentW, bitmapW } = computeContentPixelWidth({
+      duration: 4,
+      parentWidthCss: 1000,
+      totalDuration: 0,
+      dpr: 2,
+      fallbackClipWidthCss: 320,
+    })
+    expect(contentW).toBe(640)
+    expect(bitmapW).toBe(640)
   })
 })

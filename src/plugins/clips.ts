@@ -8,7 +8,10 @@ import BasePlugin, { type BasePluginEvents } from '../base-plugin.js'
 import { makeDraggable } from '../draggable.js'
 import EventEmitter from '../event-emitter.js'
 import createElement from '../dom.js'
-import { computeClipSampleWindow } from '../clip-render-math.js'
+import {
+  computeClipSampleWindow,
+  computeContentPixelWidth,
+} from '../clip-render-math.js'
 
 export type ClipsPluginOptions =
   | {
@@ -47,6 +50,10 @@ export type ClipBlockEvents = {
  * Custom render function for clip canvas content.
  * Called instead of the default waveform renderer when provided.
  * Receives the canvas context, pixel dimensions, and the clip instance.
+ * `width` is the clip's content width in device pixels and may be
+ * FRACTIONAL — it is the exact (unrounded) time→pixel scale basis, kept
+ * stable across resize-drag repaints; the backing bitmap is the rounded
+ * width, so content near the last partial pixel is cropped.
  */
 export type ClipRenderFn = (
   ctx: CanvasRenderingContext2D,
@@ -133,6 +140,21 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   private dragStartDuration: number | null = null
   /** Source-domain extent bound for trim-mode clamps, captured per drag. */
   private dragStartExtent = 0
+  /** Which edge the in-progress resize drag is on (null = no drag). */
+  private activeResizeSide: 'start' | 'end' | null = null
+  /**
+   * Lead-in painted LEFT of the clip start (seconds), custom-content
+   * clips only. During a left-edge drag the bitmap is painted once
+   * covering [clipStart − lead, clipEnd] and the canvas then SLIDES
+   * inside the element instead of repainting — repainting every frame
+   * rasterizes the counter-compensated content independently of the
+   * moving element position, and the two sub-pixel roundings disagree
+   * frame to frame (residual note jitter + seam re-shuffle flicker).
+   * Read by renderContent callbacks via the block reference.
+   */
+  public paintLeadInSec = 0
+  /** resizeStartDeltaSec at the time the current bitmap was painted. */
+  private paintAnchorDeltaSec = 0
   private rafHandle: number = 0
   /**
    * Snapshot of the inputs that produced the currently-painted canvas.
@@ -401,6 +423,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         (this.loopPhaseSec ?? 0) + this.duration,
       )
     }
+    this.activeResizeSide = side
 
     // Trim mode (no loop tiling): edges are bounded by the source content —
     // the left edge stops when the source-start offset reaches 0, the right
@@ -483,16 +506,78 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       const painted = this.lastPaintState
       if (painted && this.duration <= painted.duration) return
     }
+    // Custom-content clips slide instead: the bitmap (painted once with a
+    // paintLeadInSec margin) stays timeline-anchored by moving the canvas
+    // inside the element — the element's shift and the canvas offset
+    // cancel in the same compositor coordinate space, so the painting is
+    // perfectly still on screen. Only a drag past the painted lead-in
+    // needs a fresh paint (which re-anchors with a new margin).
+    if (side === 'start' && this.renderContent && this.lastPaintState) {
+      const slid = this.resizeStartDeltaSec - this.paintAnchorDeltaSec
+      if (slid <= this.paintLeadInSec + 1e-9) {
+        const pxPerSecCss = this.stablePxPerSecCss()
+        if (pxPerSecCss > 0 && this.canvas) {
+          this.canvas.style.left = `${(slid - this.paintLeadInSec) * pxPerSecCss}px`
+          return
+        }
+      }
+    }
     this.renderWaveform()
+  }
+
+  /** CSS px per second from the parent timeline width (drag-stable). */
+  private stablePxPerSecCss(): number {
+    const parentW =
+      this.element?.parentElement?.getBoundingClientRect().width ?? 0
+    return this.totalDuration > 0 && parentW > 0
+      ? parentW / this.totalDuration
+      : 0
+  }
+
+  /**
+   * Lead-in (seconds) to pre-paint left of the clip start when a
+   * left-edge drag begins on a custom-content clip. Generous enough that
+   * a normal drag never needs a mid-gesture repaint, clamped by: the
+   * timeline origin, the source start for trim-mode clips (offset 0 —
+   * there is no earlier content to reveal), and the canvas width ceiling.
+   */
+  private chooseLeadInSec(pxPerSecCss: number): number {
+    if (pxPerSecCss <= 0) return 0
+    const dpr = Math.max(1, window.devicePixelRatio || 1)
+    let lead = 2000 / pxPerSecCss
+    lead = Math.min(lead, Math.max(0, this.startTime))
+    const trimMode =
+      !(this.loopEnabled && this.loopEndSec - this.loopStartSec > 0.0001) &&
+      (this.originalDuration || 0) > 0.0001
+    if (trimMode) {
+      lead = Math.min(
+        lead,
+        Math.max(0, (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec),
+      )
+    }
+    const MAX_BITMAP_W = 16000
+    const maxLeadCss = Math.max(
+      0,
+      MAX_BITMAP_W / dpr - this.duration * pxPerSecCss,
+    )
+    return Math.max(0, Math.min(lead, maxLeadCss / pxPerSecCss))
   }
 
   private onEndResizing(side: 'start' | 'end') {
     // Clear drag-transient state BEFORE emitting: the host commits the
     // authoritative startTime/duration/phase in response, and its sync
     // repaint must not be double-compensated.
+    const hadLeadIn = this.paintLeadInSec > 0
     this.resizeStartDeltaSec = 0
     this.dragStartDuration = null
     this.dragStartExtent = 0
+    this.activeResizeSide = null
+    this.paintLeadInSec = 0
+    this.paintAnchorDeltaSec = 0
+    // A slid canvas must be restored to normal geometry even if the host
+    // commit turns out to be a no-op (below-threshold drag) and never
+    // triggers its own repaint.
+    if (hadLeadIn) this.renderWaveform()
     this.emit('update-end', side)
   }
 
@@ -1230,22 +1315,62 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         // to the bitmap. With `width: 100%` the bitmap rescaled against the
         // moving element every frame — a ±1px rounding of the backing store
         // rescaled the whole painting, the subtle note-shimmer seen while
-        // dragging MIDI clip edges. Overflow past the element is cropped by
-        // the clip's `overflow: hidden`.
+        // dragging MIDI clip edges. The renderer receives the UNROUNDED
+        // width (see computeContentPixelWidth) so mark positions derived
+        // from it don't tremble as the rounded bitmap width steps during a
+        // drag. Overflow past the element is cropped by the clip's
+        // `overflow: hidden`.
         const contentParent = clipEl.parentElement
         const parentW = contentParent
           ? contentParent.getBoundingClientRect().width
           : clipWidthCss
-        const pxPerSecStable =
+        const pxPerSecCss =
           this.totalDuration > 0 ? parentW / this.totalDuration : 0
-        const contentWidthCss =
-          pxPerSecStable > 0 ? this.duration * pxPerSecStable : clipWidthCss
-        const fullPixelW = Math.max(1, Math.round(contentWidthCss * dpr))
-        this.canvas.style.left = '0'
-        this.canvas.style.width = `${fullPixelW / dpr}px`
-        if (this.canvas.width !== fullPixelW) this.canvas.width = fullPixelW
-        ctx.clearRect(0, 0, fullPixelW, pixelH)
-        this.renderContent(ctx, fullPixelW, pixelH, this)
+        // Left-edge drag in progress: pre-paint a lead-in margin left of
+        // the clip start so the rest of the drag slides the canvas
+        // instead of repainting (see repaintForResizeDrag / paintLeadInSec).
+        let lead =
+          this.activeResizeSide === 'start'
+            ? this.chooseLeadInSec(pxPerSecCss)
+            : 0
+        // Quantize the re-anchor so the new bitmap's content is an EXACT
+        // whole-device-pixel translation of the previous one (positions
+        // are linear in time, so a whole-pixel origin shift translates
+        // every mark without changing its sub-pixel phase). The canvas
+        // style.left carries the fractional remainder, making the swap
+        // compositor-identical — otherwise every note's antialiasing
+        // re-rasterizes at a new sub-pixel offset and the whole clip
+        // visibly blinks once per re-anchor.
+        if (lead > 0 && this.lastPaintState && pxPerSecCss > 0) {
+          const originRelPrev =
+            this.resizeStartDeltaSec -
+            this.paintAnchorDeltaSec -
+            this.paintLeadInSec
+          const pxDevPerSec = pxPerSecCss * dpr
+          const shiftQ =
+            Math.round((originRelPrev + lead) * pxDevPerSec) / pxDevPerSec
+          const leadQ = shiftQ - originRelPrev
+          if (leadQ > 0) lead = leadQ
+        }
+        this.paintLeadInSec = lead
+        this.paintAnchorDeltaSec = this.resizeStartDeltaSec
+        const { contentW, bitmapW } = computeContentPixelWidth({
+          duration: this.duration + lead,
+          parentWidthCss: parentW,
+          totalDuration: this.totalDuration,
+          dpr,
+          fallbackClipWidthCss: clipWidthCss,
+        })
+        this.canvas.style.left = `${-lead * pxPerSecCss}px`
+        this.canvas.style.width = `${bitmapW / dpr}px`
+        if (this.canvas.width !== bitmapW) this.canvas.width = bitmapW
+        ctx.clearRect(0, 0, bitmapW, pixelH)
+        this.renderContent(ctx, contentW, pixelH, this)
+        // Persist so repaintForResizeDrag can freeze the bitmap on
+        // right-edge shrink (content marks don't depend on duration; the
+        // element's overflow crop is exact) — without this, custom-content
+        // clips repainted on every shrink mousemove.
+        persistPaintState()
         return
       }
 

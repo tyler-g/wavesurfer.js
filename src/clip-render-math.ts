@@ -93,3 +93,42 @@ export function computeClipSampleWindow(
     endSample: Math.max(0, Math.min(rawEnd, endBound)),
   }
 }
+
+export type ContentPixelWidthParams = {
+  /** Clip's current duration in seconds (changes live during a resize drag). */
+  duration: number
+  /** Width of the clips container (the timeline) in CSS px. */
+  parentWidthCss: number
+  /** Total timeline duration in seconds; <= 0 when unknown. */
+  totalDuration: number
+  /** Device pixel ratio (>= 1). */
+  dpr: number
+  /** Fallback clip CSS width when the timeline scale is unavailable. */
+  fallbackClipWidthCss?: number
+}
+
+/**
+ * Geometry for a custom-content (renderContent) clip canvas.
+ *
+ * `contentW` is the clip's content width in device pixels, deliberately
+ * UNROUNDED: content renderers position marks as fractions of this width
+ * (x = t/duration * contentW), so any rounding here changes the
+ * time→pixel scale by up to ±0.5px — and because `duration` sweeps
+ * continuously during a resize drag while the rounding steps discretely,
+ * every painted mark trembles sub-pixel from frame to frame. Keeping the
+ * scale exact makes a mark at a fixed time land on the same pixel every
+ * repaint. The canvas BITMAP must still have integer dimensions —
+ * `bitmapW` is the rounded width for that; content drawn past it (< 1px
+ * at the drag edge) is simply cropped.
+ */
+export function computeContentPixelWidth(params: ContentPixelWidthParams): {
+  contentW: number
+  bitmapW: number
+} {
+  const { duration, parentWidthCss, totalDuration, dpr } = params
+  const pxPerSec = totalDuration > 0 ? parentWidthCss / totalDuration : 0
+  const contentCssW =
+    pxPerSec > 0 ? duration * pxPerSec : (params.fallbackClipWidthCss ?? 1)
+  const contentW = Math.max(1, contentCssW * dpr)
+  return { contentW, bitmapW: Math.max(1, Math.round(contentW)) }
+}
