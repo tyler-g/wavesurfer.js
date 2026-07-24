@@ -1,6 +1,9 @@
 import {
   computeClipSampleWindow,
   computeContentPixelWidth,
+  computeLoopSeamTimes,
+  snapToGridPoint,
+  wrapTileTime,
 } from '../clip-render-math.js'
 
 describe('computeClipSampleWindow', () => {
@@ -250,5 +253,69 @@ describe('computeContentPixelWidth', () => {
     })
     expect(contentW).toBe(640)
     expect(bitmapW).toBe(640)
+  })
+})
+
+describe('wrapTileTime', () => {
+  test('wraps into [0, loopLen) for positive, negative, and zero inputs', () => {
+    expect(wrapTileTime(0, 2)).toBe(0)
+    expect(wrapTileTime(0.5, 2)).toBe(0.5)
+    expect(wrapTileTime(3.5, 2)).toBeCloseTo(1.5, 12)
+    expect(wrapTileTime(-0.5, 2)).toBeCloseTo(1.5, 12)
+    expect(wrapTileTime(-3.5, 2)).toBeCloseTo(0.5, 12)
+  })
+
+  test('FP ulp-below-zero input never returns loopLen (tile-walker hang guard)', () => {
+    // -1e-17 + 2 rounds to exactly 2.0 in IEEE754 — the naive positive
+    // modulo returns loopLen itself, and a tile walker stepping by
+    // (loopLen - tileT) makes zero progress forever.
+    const t = wrapTileTime(-1e-17, 2)
+    expect(t).toBeGreaterThanOrEqual(0)
+    expect(t).toBeLessThan(2)
+    for (const shifted of [-1e-17, -1e-300, -4.9e-324, 2 - 1e-17, 6 - 1e-16]) {
+      const w = wrapTileTime(shifted, 2)
+      expect(w).toBeGreaterThanOrEqual(0)
+      expect(w).toBeLessThan(2)
+    }
+  })
+})
+
+describe('computeLoopSeamTimes', () => {
+  test('phase 0: seams at every loopLen multiple inside the clip', () => {
+    expect(computeLoopSeamTimes(5, 2, 0, 0, 5)).toEqual([2, 4])
+  })
+
+  test('phase shifts seams left; seams outside (0, duration) excluded', () => {
+    expect(computeLoopSeamTimes(5, 2, 0.5, 0, 5)).toEqual([1.5, 3.5])
+    // phase ≥ loopLen wraps
+    expect(computeLoopSeamTimes(5, 2, 2.5, 0, 5)).toEqual([1.5, 3.5])
+    // negative (drag-compensated) phase wraps too
+    expect(computeLoopSeamTimes(5, 2, -0.5, 0, 5)[0]).toBeCloseTo(0.5, 9)
+  })
+
+  test('window restricts the seam range (viewport-windowed canvases)', () => {
+    expect(computeLoopSeamTimes(100, 2, 0, 10, 14)).toEqual([10, 12, 14])
+  })
+
+  test('degenerate inputs return no seams', () => {
+    expect(computeLoopSeamTimes(5, 0, 0, 0, 5)).toEqual([])
+    expect(computeLoopSeamTimes(1.5, 2, 0, 0, 1.5)).toEqual([])
+  })
+})
+
+describe('snapToGridPoint', () => {
+  test('snaps within threshold, in both directions', () => {
+    expect(snapToGridPoint(3.93, 2, -0.5, 0.1)).toBeNull()
+    expect(snapToGridPoint(3.45, 2, -0.5, 0.1)).toBeCloseTo(3.5, 9)
+    expect(snapToGridPoint(3.56, 2, -0.5, 0.1)).toBeCloseTo(3.5, 9)
+  })
+
+  test('negative grid indices work (left-extend past the clip start)', () => {
+    // grid offset 10 − φ' with step 2: points …, 6, 8, 10
+    expect(snapToGridPoint(6.05, 2, 10, 0.1)).toBeCloseTo(6, 9)
+  })
+
+  test('degenerate step never snaps', () => {
+    expect(snapToGridPoint(1, 0, 0, 0.5)).toBeNull()
   })
 })

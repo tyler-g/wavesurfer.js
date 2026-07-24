@@ -132,3 +132,66 @@ export function computeContentPixelWidth(params: ContentPixelWidthParams): {
   const contentW = Math.max(1, contentCssW * dpr)
   return { contentW, bitmapW: Math.max(1, Math.round(contentW)) }
 }
+
+/**
+ * Positive-modulo wrap of a (phase-shifted) clip time into a loop tile:
+ * returns tileT in [0, loopLen). Guards the floating-point edge where
+ * `shifted` sits within one ulp BELOW zero (or below a tile multiple) and
+ * the mod subtraction lands EXACTLY on loopLen — callers that step by the
+ * remaining tile (`loopLen − tileT`) would otherwise make a zero-progress
+ * step and hang (this is reachable: left-edge resize drags paint canvas
+ * windows at negative clip times).
+ */
+export function wrapTileTime(shifted: number, loopLen: number): number {
+  let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
+  if (tileT < 0) tileT += loopLen
+  if (tileT >= loopLen) tileT = 0
+  return tileT
+}
+
+/**
+ * Clip-relative times (seconds) of loop wrap points ("seams") inside
+ * [windowStart, windowEnd] ∩ (0, duration). A seam sits wherever the
+ * tiled playback wraps: t = k·loopLen − (phase mod loopLen), k ≥ 1.
+ * Pass the DRAG-COMPENSATED phase (paintPhaseSec) so seams stay
+ * timeline-anchored while a left-edge resize is in progress.
+ */
+export function computeLoopSeamTimes(
+  duration: number,
+  loopLen: number,
+  phaseInLoop: number,
+  windowStart: number,
+  windowEnd: number,
+): number[] {
+  if (!(loopLen > 0) || !(duration > 0)) return []
+  const phi = ((phaseInLoop % loopLen) + loopLen) % loopLen
+  const lo = Math.max(1e-9, windowStart)
+  const hi = Math.min(duration - 1e-9, windowEnd)
+  if (hi <= lo) return []
+  const seams: number[] = []
+  let k = Math.max(1, Math.ceil((lo + phi) / loopLen))
+  for (; k * loopLen - phi <= hi; k++) {
+    const t = k * loopLen - phi
+    if (t >= lo) seams.push(t)
+    if (seams.length >= 5000) break
+  }
+  return seams
+}
+
+/**
+ * Magnetic snap onto a regular grid `m·step + offset` (any integer m).
+ * Returns the snapped value when the candidate is within thresholdSec of
+ * a grid point, else null. Used to snap resize-drag edges onto loop
+ * seams — deliberately independent of the host's snap-to-grid setting.
+ */
+export function snapToGridPoint(
+  candidate: number,
+  step: number,
+  offset: number,
+  thresholdSec: number,
+): number | null {
+  if (!(step > 0) || !(thresholdSec >= 0)) return null
+  const m = Math.round((candidate - offset) / step)
+  const snapped = m * step + offset
+  return Math.abs(snapped - candidate) <= thresholdSec ? snapped : null
+}

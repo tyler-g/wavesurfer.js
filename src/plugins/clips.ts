@@ -11,6 +11,9 @@ import createElement from '../dom.js'
 import {
   computeClipSampleWindow,
   computeContentPixelWidth,
+  computeLoopSeamTimes,
+  snapToGridPoint,
+  wrapTileTime,
 } from '../clip-render-math.js'
 
 export type ClipsPluginOptions =
@@ -142,6 +145,17 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   private dragStartExtent = 0
   /** Which edge the in-progress resize drag is on (null = no drag). */
   private activeResizeSide: 'start' | 'end' | null = null
+  /**
+   * UNSNAPPED virtual edge positions for the current resize drag. Loop-
+   * seam snapping applies to these, not to the applied values — snapping
+   * the applied position directly would trap the edge at the seam (every
+   * subsequent small delta re-snaps). Null outside drags.
+   */
+  private dragVirtualStart: number | null = null
+  private dragVirtualDuration: number | null = null
+  /** Timeline position of a tile-grid origin, captured at drag start —
+   *  the (drag-stable) left-edge snap targets are this + k·loopLen. */
+  private dragSeamGridOrigin = 0
   /**
    * Lead-in painted LEFT of the clip start (seconds), custom-content
    * clips only. During a left-edge drag the bitmap is painted once
@@ -422,6 +436,16 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.originalDuration || 0,
         (this.loopPhaseSec ?? 0) + this.duration,
       )
+      this.dragVirtualStart = this.startTime
+      this.dragVirtualDuration = this.duration
+      // Timeline position of a tile-grid origin (left edge minus its
+      // in-loop phase). Drag-stable: the left-edge seam-snap targets are
+      // this + k·loopLen for any integer k.
+      const seamLoopLen = this.loopEndSec - this.loopStartSec
+      this.dragSeamGridOrigin =
+        this.loopEnabled && seamLoopLen > 0.0001
+          ? this.startTime - this.paintPhaseSec(seamLoopLen)
+          : 0
     }
     this.activeResizeSide = side
 
@@ -446,32 +470,65 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.peaksPreLooped = false
     }
 
+    // Loop-seam magnet: loop-tiled clips snap a dragged edge onto the
+    // nearest tile boundary when within reach — independent of the host's
+    // snap-to-grid setting (a bounced clip landing exactly on its loop
+    // point is almost always what the user wants). Snapping is computed
+    // against the VIRTUAL (unsnapped) edge so the magnet can be escaped.
+    const snapThresholdSec = trimMode ? 0 : this.loopSnapThresholdSec(width)
+    const snapLoopLen = this.loopEndSec - this.loopStartSec
+
     if (side === 'start') {
-      let newStart = this.startTime + deltaSeconds
-      let newDuration = this.duration - deltaSeconds
+      this.dragVirtualStart =
+        (this.dragVirtualStart ?? this.startTime) + deltaSeconds
+      let targetStart = this.dragVirtualStart
+      if (snapThresholdSec > 0) {
+        const snapped = snapToGridPoint(
+          targetStart,
+          snapLoopLen,
+          this.dragSeamGridOrigin,
+          snapThresholdSec,
+        )
+        if (snapped != null && snapped >= 0) targetStart = snapped
+      }
+      let stepDelta = targetStart - this.startTime
+      let newStart = this.startTime + stepDelta
+      let newDuration = this.duration - stepDelta
       if (trimMode) {
         // Left edge cannot reveal earlier than the source start (offset 0).
-        const nextAccum = this.resizeStartDeltaSec - deltaSeconds
+        const nextAccum = this.resizeStartDeltaSec - stepDelta
         const newOffset = (this.loopPhaseSec ?? 0) - nextAccum
         if (newOffset < 0) {
           const excess = -newOffset
           newStart += excess
           newDuration -= excess
-          deltaSeconds += excess
+          stepDelta += excess
         }
       }
-      if (newStart >= 0 && newDuration > 0.01) {
+      if (stepDelta !== 0 && newStart >= 0 && newDuration > 0.01) {
         this.startTime = newStart
         this.duration = newDuration
         // Track cumulative left-edge movement (positive = extended left) so
         // painting can keep content timeline-anchored mid-drag.
-        this.resizeStartDeltaSec -= deltaSeconds
+        this.resizeStartDeltaSec -= stepDelta
         this.renderPosition()
         this.repaintForResizeDrag('start')
         this.emit('update', 'start')
       }
     } else {
-      let newDuration = this.duration + deltaSeconds
+      this.dragVirtualDuration =
+        (this.dragVirtualDuration ?? this.duration) + deltaSeconds
+      let newDuration = this.dragVirtualDuration
+      if (snapThresholdSec > 0) {
+        // Right-edge seam grid on the duration axis: k·loopLen − φ.
+        const snapped = snapToGridPoint(
+          newDuration,
+          snapLoopLen,
+          -this.paintPhaseSec(snapLoopLen),
+          snapThresholdSec,
+        )
+        if (snapped != null && snapped > 0.01) newDuration = snapped
+      }
       if (trimMode) {
         const offset = (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec
         const maxDur = this.dragStartExtent - offset
@@ -484,6 +541,22 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.emit('update', 'end')
       }
     }
+  }
+
+  /**
+   * Magnetic capture radius (seconds) for loop-seam snapping during
+   * resize drags: 8 CSS px, but zero when the clip isn't loop-tiled or
+   * its tiles are so narrow that seam-snapping would make the whole drag
+   * feel sticky.
+   */
+  private loopSnapThresholdSec(parentWidthCss: number): number {
+    const loopLen = this.loopEndSec - this.loopStartSec
+    if (!(this.loopEnabled && loopLen > 0.0001)) return 0
+    const pxPerSec =
+      this.totalDuration > 0 ? parentWidthCss / this.totalDuration : 0
+    if (pxPerSec <= 0) return 0
+    if (loopLen * pxPerSec < 16) return 0
+    return 8 / pxPerSec
   }
 
   /**
@@ -572,6 +645,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.dragStartDuration = null
     this.dragStartExtent = 0
     this.activeResizeSide = null
+    this.dragVirtualStart = null
+    this.dragVirtualDuration = null
+    this.dragSeamGridOrigin = 0
     this.paintLeadInSec = 0
     this.paintAnchorDeltaSec = 0
     // A slid canvas must be restored to normal geometry even if the host
@@ -976,10 +1052,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       const clipT = cssPx * secPerCssPx
       // Fold the loop phase into the tile time before wrapping — at
       // phase 0 this reduces to the original expression exactly.
+      // Positive-modulo with the FP loopLen-edge snap (wrapTileTime):
+      // shifted can be negative (phase offset, negative drag window).
       const shifted = clipT + loopPhaseSec
-      // Positive-modulo: shifted can be negative (phase offset, or fp on x=0).
-      let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
-      if (tileT < 0) tileT += loopLen
+      const tileT = wrapTileTime(shifted, loopLen)
       const srcSample = loopStartSample + Math.floor(tileT * sr)
       if (srcSample < 0 || srcSample >= channel.length) {
         inSubpath = false
@@ -1012,8 +1088,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
         const clipT = cssPx * secPerCssPx
         const shifted = clipT + loopPhaseSec
-        let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
-        if (tileT < 0) tileT += loopLen
+        const tileT = wrapTileTime(shifted, loopLen)
         const srcSample = loopStartSample + Math.floor(tileT * sr)
         if (srcSample < 0 || srcSample >= channel.length) continue
         const s = channel[srcSample]
@@ -1066,13 +1141,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       let maxAbs = 0
       // Walk one tile segment at a time. Each iteration consumes either
       // the remainder of the current tile or the rest of the pixel range,
-      // whichever is smaller.
+      // whichever is smaller. The Math.max floor guarantees forward
+      // progress — wrapTileTime snaps the FP tileT==loopLen edge, and the
+      // epsilon covers any other degenerate remainder.
       while (t < clipTR) {
         const shifted = t + loopPhaseSec
-        let tileT = shifted - Math.floor(shifted / loopLen) * loopLen
-        if (tileT < 0) tileT += loopLen
+        const tileT = wrapTileTime(shifted, loopLen)
         const remInTile = loopLen - tileT
-        const tSegEnd = Math.min(clipTR, t + remInTile)
+        const tSegEnd = Math.min(clipTR, t + Math.max(remInTile, 1e-9))
         const srcStart = loopStartSample + Math.floor(tileT * sr)
         const srcEnd = Math.min(
           loopEndSample,
@@ -1136,11 +1212,45 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // edge approaches or exits the canvas coverage.
       const scrollEl = this.ownerPlugin?.getScrollEl() ?? null
       const SCROLL_MARGIN_CSS = 600
+
+      // During a left-edge resize drag, let the canvas window extend LEFT
+      // of the clip origin (negative window coords) so the strip being
+      // revealed by an extend is already painted. The tiled painters wrap
+      // negative time via positive-modulo; the plain (trim) sample window
+      // is bounded here by the remaining source offset (there is nothing
+      // earlier than source start to show), and everything is bounded by
+      // timeline zero. All three bounds are timeline-fixed during the
+      // drag, which is what keeps the window constant frame-to-frame.
+      let minLeftCss = 0
+      const dragSecPerCssPx = this.secPerCssPx(clipWidthCss)
+      if (
+        this.activeResizeSide === 'start' &&
+        !this.renderContent &&
+        dragSecPerCssPx > 0
+      ) {
+        const pxPerSecCss = 1 / dragSecPerCssPx
+        let boundCss = -Math.max(0, this.startTime) * pxPerSecCss
+        const trimMode =
+          !(this.loopEnabled && this.loopEndSec - this.loopStartSec > 0.0001) &&
+          (this.originalDuration || 0) > 0.0001
+        if (trimMode) {
+          const offsetLeftSec = Math.max(
+            0,
+            (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec,
+          )
+          boundCss = Math.max(boundCss, -offsetLeftSec * pxPerSecCss)
+        }
+        minLeftCss = Math.min(0, boundCss)
+      }
+
       let canvasLeftCss: number
       let canvasWidthCss: number
       if (scrollEl) {
         const scrollRect = scrollEl.getBoundingClientRect()
-        const visibleLeftInClip = Math.max(0, scrollRect.left - clipRect.left)
+        const visibleLeftInClip = Math.max(
+          minLeftCss,
+          scrollRect.left - clipRect.left,
+        )
         const visibleRightInClip = Math.min(
           clipWidthCss,
           scrollRect.right - clipRect.left,
@@ -1168,7 +1278,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           canvasLeftCss = last.canvasLeftCss
           canvasWidthCss = last.canvasWidthCss
         } else {
-          canvasLeftCss = Math.max(0, visibleLeftInClip - SCROLL_MARGIN_CSS)
+          canvasLeftCss = Math.max(
+            minLeftCss,
+            visibleLeftInClip - SCROLL_MARGIN_CSS,
+          )
           const canvasRightCss = Math.min(
             clipWidthCss,
             visibleRightInClip + SCROLL_MARGIN_CSS,
@@ -1189,7 +1302,29 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // rounds to a slightly different value on every repaint — during
       // a live resize drag that reads as the waveform trembling.
       // Quantized, the scale is exactly 1/dpr on every frame.
-      canvasLeftCss = Math.round(canvasLeftCss * dpr) / dpr
+      //
+      // The window POSITION is quantized on the TIMELINE device-pixel
+      // grid — the clip's timeline position plus the window offset —
+      // NOT clip-relative. The clip origin sits at a fractional position
+      // (and moves fractionally during a left-edge drag), so rounding in
+      // clip coordinates would land the window on a slightly different
+      // timeline alignment per repaint and the waveform would visibly
+      // re-rasterize: trembling during drags, and a one-shot "redraw"
+      // shimmer when the release repaint didn't share the drag repaints'
+      // grid. The timeline grid is invariant across drag frames
+      // (startTime and the window offset shift complementarily), across
+      // the release repaint (same startTime), and under scroll — so
+      // consecutive repaints are pixel-identical or exact whole-pixel
+      // translations, never a sub-pixel re-rasterization.
+      if (!this.renderContent && dragSecPerCssPx > 0) {
+        const pxPerSecCss = 1 / dragSecPerCssPx
+        const clipTimelineLeftCss = this.startTime * pxPerSecCss
+        const timelineBase = clipTimelineLeftCss + canvasLeftCss
+        canvasLeftCss =
+          Math.round(timelineBase * dpr) / dpr - clipTimelineLeftCss
+      } else {
+        canvasLeftCss = Math.round(canvasLeftCss * dpr) / dpr
+      }
       canvasWidthCss = Math.round(canvasWidthCss * dpr) / dpr
       if (canvasWidthCss <= 0) return
 
@@ -1202,7 +1337,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // full buffer into the shrinking width (the store only re-slices
       // PCM on drag end) — see computeClipSampleWindow.
       const totalSamples = this.pcm?.[0]?.length ?? 0
-      const stableSecPerCssPx = this.secPerCssPx(clipWidthCss)
+      const stableSecPerCssPx = dragSecPerCssPx
       const { startSample, endSample } = computeClipSampleWindow({
         totalSamples,
         duration: this.duration,
@@ -1411,6 +1546,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
               this.loopStartSec, this.loopEndSec, this.paintPhaseSec(loopLen),
             ),
           )) {
+            this.drawLoopSeamNotches(
+              ctx, pixelW, pixelH, canvasLeftCss, canvasWidthCss,
+              clipWidthCss, loopLen, this.paintPhaseSec(loopLen),
+            )
             persistPaintState()
             return
           }
@@ -1479,9 +1618,57 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           pixelH / 2,
           'rgba(255,255,255,0.4)',
         )
+        const fbLoopLen = this.loopEndSec - this.loopStartSec
+        if (this.loopEnabled && fbLoopLen > 0.0001) {
+          this.drawLoopSeamNotches(
+            ctx, pixelW, pixelH, canvasLeftCss, canvasWidthCss,
+            clipWidthCss, fbLoopLen, this.paintPhaseSec(fbLoopLen),
+          )
+        }
         persistPaintState()
       }
     })
+  }
+
+  /**
+   * Small notch ticks at the clip's top edge marking loop wrap points
+   * (tile seams), so an extended bounced clip shows exactly where it
+   * loops. Pass the DRAG-COMPENSATED phase (paintPhaseSec) so notches
+   * stay timeline-anchored mid-resize. Skipped when tiles are too narrow
+   * for the marks to be meaningful (same 16px floor as seam snapping).
+   */
+  private drawLoopSeamNotches(
+    ctx: CanvasRenderingContext2D,
+    pixelW: number,
+    pixelH: number,
+    canvasLeftCss: number,
+    canvasWidthCss: number,
+    clipWidthCss: number,
+    loopLen: number,
+    phaseInLoop: number,
+  ) {
+    const secPerCss = this.secPerCssPx(clipWidthCss)
+    if (!(secPerCss > 0) || !(loopLen > 0) || canvasWidthCss <= 0) return
+    if (loopLen / secPerCss < 16) return
+    const seams = computeLoopSeamTimes(
+      this.duration,
+      loopLen,
+      phaseInLoop,
+      canvasLeftCss * secPerCss,
+      (canvasLeftCss + canvasWidthCss) * secPerCss,
+    )
+    if (seams.length === 0) return
+    const dpr = pixelW / canvasWidthCss
+    const notchH = Math.min(pixelH, 7 * dpr)
+    for (const t of seams) {
+      const x = (t / secPerCss - canvasLeftCss) * dpr
+      // Dark underlay + light tick so the mark reads on any clip color
+      // and over any waveform density.
+      ctx.fillStyle = 'rgba(0,0,0,0.45)'
+      ctx.fillRect(x - 1.5 * dpr, 0, 3 * dpr, notchH)
+      ctx.fillStyle = 'rgba(255,255,255,0.95)'
+      ctx.fillRect(x - 0.5 * dpr, 0, dpr, notchH)
+    }
   }
 
   public setSelected(selected: boolean) {
