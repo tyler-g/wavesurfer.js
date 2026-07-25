@@ -31,6 +31,10 @@ export type ClipsPluginOptions =
 export type ClipsPluginEvents = BasePluginEvents & {
   'clip-added': [clip: ClipBlockImpl]
   'clip-removed': [clip: ClipBlockImpl]
+  /** Continuous during a body drag (one per pointer move) — lets the host
+   *  live-preview group moves of a multi-selection. Resize does NOT emit
+   *  this; it fires 'update' with a side. */
+  'clip-drag': [clip: ClipBlockImpl]
   'clip-drag-end': [clip: ClipBlockImpl]
   'clip-resize-end': [clip: ClipBlockImpl, side: 'start' | 'end']
   'clip-clicked': [clip: ClipBlockImpl, e: MouseEvent]
@@ -203,6 +207,22 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   /** Reference to the owning plugin so the clip can read the shared
    *  visible-time range for viewport culling. */
   private ownerPlugin: ClipsPlugin | undefined
+
+  /**
+   * Ableton-style body-drag ghost. During a move the clip element itself
+   * STAYS at its committed position; a translucent clone (canvas bitmaps
+   * blitted once at drag start — no waveform recompute) tracks the pointer,
+   * snapped to the grid when the host's snapConfig is enabled. The clip
+   * commits to the ghost position on release. Hosts can also drive a ghost
+   * directly via showDragGhost()/hideDragGhost() to preview group moves of
+   * clips that aren't the one being dragged.
+   */
+  private dragGhostEl: HTMLElement | null = null
+  /** Unsnapped pointer-follow position of the in-progress body drag. */
+  private dragVirtualTime: number | null = null
+  /** Where the ghost currently sits — the position a release would commit.
+   *  Null when no body drag / host preview is active. */
+  public dragTargetTime: number | null = null
 
   constructor(params: ClipParams, totalDuration: number, ownerPlugin?: ClipsPlugin) {
     super()
@@ -401,6 +421,13 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         },
         () => {
           element.classList.remove('ws-clip--dragging')
+          // Commit the ghost position, then clean up before emitting so the
+          // host's update-end handler sees the final startTime on the block.
+          if (this.dragTargetTime != null) {
+            this.startTime = this.dragTargetTime
+            this.renderPosition()
+          }
+          this.hideDragGhost()
           this.emit('update-end')
         },
       ),
@@ -411,13 +438,65 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (!this.element?.parentElement) return
     const { width } = this.element.parentElement.getBoundingClientRect()
     const deltaSeconds = (dx / width) * this.totalDuration
-    const newStart = this.startTime + deltaSeconds
 
-    if (newStart >= 0) {
-      this.startTime = newStart
-      this.renderPosition()
-      this.emit('update')
+    // Ableton-style move: the clip element stays at its committed position;
+    // a translucent ghost tracks the pointer — snapped to the nearest grid
+    // line when the host's snap config is enabled, free otherwise — and the
+    // release commits wherever the ghost sits.
+    const base = this.dragVirtualTime ?? this.startTime
+    const virtual = Math.max(0, base + deltaSeconds)
+    this.dragVirtualTime = virtual
+
+    const snap = this.ownerPlugin?.snapConfig
+    let target = virtual
+    if (snap?.enabled && snap.gridSeconds > 0) {
+      target = Math.round(virtual / snap.gridSeconds) * snap.gridSeconds
     }
+    this.showDragGhost(Math.max(0, target))
+    this.emit('update')
+  }
+
+  /**
+   * Build the ghost: a deep clone of the clip element. cloneNode leaves
+   * canvas bitmaps blank, so each canvas is blitted from its source once —
+   * after that a drag only updates style.left.
+   */
+  private buildDragGhost(): HTMLElement | null {
+    if (!this.element?.parentElement) return null
+    const ghost = this.element.cloneNode(true) as HTMLElement
+    const srcCanvases = this.element.querySelectorAll('canvas')
+    const dstCanvases = ghost.querySelectorAll('canvas')
+    srcCanvases.forEach((src, i) => {
+      const dst = dstCanvases[i] as HTMLCanvasElement | undefined
+      const srcCanvas = src as HTMLCanvasElement
+      if (!dst || srcCanvas.width === 0 || srcCanvas.height === 0) return
+      dst.width = srcCanvas.width
+      dst.height = srcCanvas.height
+      dst.getContext('2d')?.drawImage(srcCanvas, 0, 0)
+    })
+    ghost.classList.add('ws-clip-ghost')
+    ghost.classList.remove('ws-clip--dragging')
+    ghost.style.opacity = '0.45'
+    ghost.style.pointerEvents = 'none'
+    this.element.parentElement.appendChild(ghost)
+    return ghost
+  }
+
+  /** Show (creating on first call) the drag ghost at `startTime`. */
+  public showDragGhost(startTime: number) {
+    if (!this.dragGhostEl) this.dragGhostEl = this.buildDragGhost()
+    if (!this.dragGhostEl) return
+    this.dragTargetTime = Math.max(0, startTime)
+    const leftPct = (this.dragTargetTime / this.totalDuration) * 100
+    this.dragGhostEl.style.left = `${leftPct}%`
+  }
+
+  /** Remove the drag ghost and clear drag-preview state. */
+  public hideDragGhost() {
+    this.dragGhostEl?.remove()
+    this.dragGhostEl = null
+    this.dragTargetTime = null
+    this.dragVirtualTime = null
   }
 
   private onResize(dx: number, side: 'start' | 'end') {
@@ -1789,6 +1868,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
   public remove() {
     this.emit('remove')
+    this.hideDragGhost()
     this.subscriptions.forEach((unsub) => unsub())
     this.subscriptions = []
     if (this.rafHandle) {
@@ -1925,6 +2005,10 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
     clip.on('click', (e) => this.emit('clip-clicked', clip, e))
     clip.on('dblclick', (e) => this.emit('clip-dblclick', clip, e))
     clip.on('context-menu', (e) => this.emit('clip-context-menu', clip, e))
+    clip.on('update', (side) => {
+      // Side-less update = body drag; sided updates are resizes
+      if (!side) this.emit('clip-drag', clip)
+    })
     clip.on('update-end', (side) => {
       if (side === 'start' || side === 'end') {
         this.emit('clip-resize-end', clip, side)

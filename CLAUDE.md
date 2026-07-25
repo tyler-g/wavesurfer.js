@@ -32,6 +32,10 @@ WaveSurfer renders inside a shadow root (`src/renderer.ts`). External CSS **cann
 
 Has a `gridSubdivision` option and `setGridSubdivision()` method for variable grid density — used by Wavvy's per-track gridlines.
 
+## ClipsPlugin drag ghost
+
+Body drags are Ableton-style (since 2026-07-25): the clip element stays put and a translucent clone (`.ws-clip-ghost`, canvas bitmaps blitted once at drag start) tracks the pointer — snapped to the grid when the host's `setSnapConfig` is enabled — committing on release. Continuous `clip-drag` plugin event fires per pointer move; `clip-drag-end` still sees the final `startTime` on the block. Public per-clip API `showDragGhost(t)` / `hideDragGhost()` + readable `dragTargetTime` let the host preview group moves on non-dragged clips. Details: wavvy's `docs/architecture/clip-rendering.md` "Body-drag ghost".
+
 ## Notes
 
 - See `AGENTS.md` in this dir for guidance targeting other AI agents (Codex, Gemini, etc.).
