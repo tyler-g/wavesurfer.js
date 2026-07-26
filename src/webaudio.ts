@@ -27,6 +27,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   private _volumeBeforeMute = 1
   private _playbackRate = 1
   private _duration: number | undefined = undefined
+  private _projectDuration = 0
   private buffer: AudioBuffer | null = null
   public currentSrc = ''
   public paused = true
@@ -271,10 +272,21 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   }
 
   get duration() {
-    return this._duration ?? (this.buffer?.duration || 0)
+    return Math.max(this._duration ?? (this.buffer?.duration || 0), this._projectDuration)
   }
   set duration(value: number) {
     this._duration = value
+  }
+
+  /** Lift the player's logical duration to the project timeline length.
+   *  The audio buffer (often a short silent placeholder) is never regrown when
+   *  the timeline extends, so without this the source node's end would freeze
+   *  currentTime and self-pause the player mid-transport. With the lift,
+   *  currentTime keeps advancing off the AudioContext clock past the buffer
+   *  end, and play() from a position beyond the buffer no longer resets to 0.
+   *  Never truncates: `duration` is the max of this and the real audio length. */
+  setProjectDuration(seconds: number) {
+    this._projectDuration = seconds
   }
 
   get volume() {

@@ -142,7 +142,7 @@ describe('Renderer', () => {
     const progressContainer = document.createElement('div')
     const data = [new Float32Array([0, 1])] as any
     Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 200 })
-    ;(renderer as any).renderMultiCanvas(data, { barWidth: 1 }, 200, 10, canvasContainer, progressContainer)
+    ;(renderer as any).renderMultiCanvas(data, { barWidth: 1 }, 200, 200, 10, canvasContainer, progressContainer)
     expect(canvasContainer.querySelector('canvas')).not.toBeNull()
   })
 

@@ -849,8 +849,13 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       })
       // Clear the continuous waveform preview so it doesn't show behind clips.
       // Keep the current duration so zoom/scroll/getCurrentTime() remain valid.
+      // Raw decoded duration, NOT getDuration(): the player's duration is
+      // lifted to the project timeline (setProjectDuration), and feeding the
+      // lifted value back into the preview buffer would ratchet the host's
+      // content-extent computation so the timeline could never shrink back.
       if (this.dataWindow && this.wavesurfer) {
-        const currentDuration = this.wavesurfer.getDuration() || endTime + 2
+        const currentDuration =
+          this.wavesurfer.getDecodedData()?.duration || this.wavesurfer.getDuration() || endTime + 2
         this.dataWindow.fill(0)
         this.wavesurfer.updatePeaks([this.dataWindow], currentDuration)
       }

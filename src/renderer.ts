@@ -418,6 +418,7 @@ class Renderer extends EventEmitter<RendererEvents> {
     channelData: Array<Float32Array | number[]>,
     options: WaveSurferOptions,
     width: number,
+    dataWidth: number,
     height: number,
     canvasContainer: HTMLElement,
     progressContainer: HTMLElement,
@@ -425,6 +426,10 @@ class Renderer extends EventEmitter<RendererEvents> {
     const pixelRatio = this.getPixelRatio()
     const { clientWidth } = this.scrollContainer
     const totalWidth = width / pixelRatio
+    // CSS-px extent of the actual audio data — the slice denominator. Tiles
+    // beyond it have nothing to draw; the boundary tile is drawn narrower so
+    // its slice isn't stretched across the full tile width.
+    const dataTotal = dataWidth / pixelRatio
 
     let singleCanvasWidth = Math.min(Renderer.MAX_CANVAS_WIDTH, clientWidth, totalWidth)
     let drawnIndexes: Record<number, boolean> = {}
@@ -459,12 +464,14 @@ class Renderer extends EventEmitter<RendererEvents> {
       }
 
       if (clampedWidth <= 0) return
+      const drawWidth = Math.min(clampedWidth, dataTotal - offset)
+      if (drawWidth <= 0) return
       const data = channelData.map((channel) => {
-        const start = Math.floor((offset / totalWidth) * channel.length)
-        const end = Math.floor(((offset + clampedWidth) / totalWidth) * channel.length)
+        const start = Math.floor((offset / dataTotal) * channel.length)
+        const end = Math.floor(((offset + drawWidth) / dataTotal) * channel.length)
         return channel.slice(start, end)
       })
-      this.renderSingleCanvas(data, options, clampedWidth, height, offset, canvasContainer, progressContainer)
+      this.renderSingleCanvas(data, options, drawWidth, height, offset, canvasContainer, progressContainer)
     }
 
     // Clear canvases to avoid too many DOM nodes
@@ -515,6 +522,7 @@ class Renderer extends EventEmitter<RendererEvents> {
     channelData: Array<Float32Array | number[]>,
     { overlay, ...options }: WaveSurferOptions & { overlay?: boolean },
     width: number,
+    dataWidth: number,
     channelIndex: number,
   ) {
     // A container for canvases
@@ -532,7 +540,7 @@ class Renderer extends EventEmitter<RendererEvents> {
     this.progressWrapper.appendChild(progressContainer)
 
     // Render the waveform
-    this.renderMultiCanvas(channelData, options, width, height, canvasContainer, progressContainer)
+    this.renderMultiCanvas(channelData, options, width, dataWidth, height, canvasContainer, progressContainer)
   }
 
   async render(audioData: AudioBuffer) {
@@ -575,18 +583,27 @@ class Renderer extends EventEmitter<RendererEvents> {
 
     this.emit('render')
 
+    // Pixel extent of the ACTUAL audio. With a projectDuration the wrapper is
+    // wider than the audio — the data must occupy audioDuration * pxPerSec of
+    // it, never be stretched across the full wrapper (that drew the live
+    // recording waveform ahead of the cursor whenever the project timeline
+    // outgrew the recording buffer). Without projectDuration this equals
+    // `width`, preserving upstream behavior exactly.
+    const dataWidth =
+      effectiveDuration > 0 ? Math.min(width, (audioData.duration / effectiveDuration) * width) : width
+
     // Render the waveform
     if (this.options.splitChannels) {
       // Render a waveform for each channel
       for (let i = 0; i < audioData.numberOfChannels; i++) {
         const options = { ...this.options, ...this.options.splitChannels?.[i] }
-        this.renderChannel([audioData.getChannelData(i)], options, width, i)
+        this.renderChannel([audioData.getChannelData(i)], options, width, dataWidth, i)
       }
     } else {
       // Render a single waveform for the first two channels (left and right)
       const channels = [audioData.getChannelData(0)]
       if (audioData.numberOfChannels > 1) channels.push(audioData.getChannelData(1))
-      this.renderChannel(channels, this.options, width, 0)
+      this.renderChannel(channels, this.options, width, dataWidth, 0)
     }
 
     // Must be emitted asynchronously for backward compatibility
@@ -607,6 +624,11 @@ class Renderer extends EventEmitter<RendererEvents> {
     const useParentWidth = this.options.fillParent && !this.isScrollable
     const width = (useParentWidth ? parentWidth : scrollWidth) * pixelRatio
     const totalWidth = width / pixelRatio
+    // CSS-px extent of the actual audio — the slice denominator (see render()).
+    // Data occupies audioDuration * pxPerSec of the wrapper, never stretched
+    // across a wider projectDuration-based wrapper.
+    const dataTotal =
+      effectiveDuration > 0 ? Math.min(totalWidth, (audioData.duration / effectiveDuration) * totalWidth) : totalWidth
 
     // Preserve scroll position across DOM updates
     const savedScroll = this.scrollContainer.scrollLeft
@@ -692,24 +714,28 @@ class Renderer extends EventEmitter<RendererEvents> {
 
         const offset = canvasIdx * singleCanvasWidth
         const clampedWidth = Math.min(totalWidth - offset, singleCanvasWidth)
+        // Only the portion of the tile covered by actual audio gets a canvas
+        // width — a boundary tile is drawn narrower so its data slice isn't
+        // stretched, and tiles fully beyond the audio collapse to width 0.
+        const drawWidth = Math.max(0, Math.min(clampedWidth, dataTotal - offset))
 
-        const newPixelWidth = Math.round(clampedWidth * pixelRatio)
+        const newPixelWidth = Math.round(drawWidth * pixelRatio)
         const newPixelHeight = Math.round(height * pixelRatio)
 
         // Resize canvas only if dimensions actually changed
         if (canvas.width !== newPixelWidth || canvas.height !== newPixelHeight) {
           canvas.width = newPixelWidth
           canvas.height = newPixelHeight
-          canvas.style.width = `${Math.round(clampedWidth)}px`
+          canvas.style.width = `${Math.round(drawWidth)}px`
           canvas.style.height = `${height}px`
         }
         canvas.style.left = `${Math.round(offset)}px`
 
         const ctx = canvas.getContext('2d')
-        if (ctx) {
+        if (ctx && drawWidth > 0) {
           ctx.clearRect(0, 0, canvas.width, canvas.height)
-          const start = Math.floor((offset / totalWidth) * channelData[0].length)
-          const end = Math.floor(((offset + clampedWidth) / totalWidth) * channelData[0].length)
+          const start = Math.floor((offset / dataTotal) * channelData[0].length)
+          const end = Math.floor(((offset + drawWidth) / dataTotal) * channelData[0].length)
           const data = channelData.map((c) => c.slice(start, end))
           this.renderWaveform(data, options, ctx)
         }

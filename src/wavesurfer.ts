@@ -391,6 +391,19 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     if (options.mediaControls != null) {
       this.getMediaElement().controls = options.mediaControls
     }
+    if (options.projectDuration != null) {
+      this.propagateProjectDuration()
+    }
+  }
+
+  /** Keep the WebAudioPlayer's logical duration in sync with the project
+   *  timeline so a track whose buffer (e.g. the silent placeholder) is shorter
+   *  than the project doesn't self-pause and freeze currentTime mid-transport. */
+  private propagateProjectDuration() {
+    const media = this.getMediaElement()
+    if (media instanceof WebAudioPlayer) {
+      media.setProjectDuration(this.options.projectDuration || 0)
+    }
   }
 
   /** Register a wavesurfer.js plugin */
@@ -523,6 +536,7 @@ class WaveSurfer extends Player<WaveSurferEvents> {
         media.duration = audioDuration
       }
     }
+    this.propagateProjectDuration()
 
     // Decode the audio data or use user-provided peaks
     if (channelData) {
