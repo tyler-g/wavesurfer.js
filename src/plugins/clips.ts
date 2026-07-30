@@ -557,6 +557,16 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const snapThresholdSec = trimMode ? 0 : this.loopSnapThresholdSec(width)
     const snapLoopLen = this.loopEndSec - this.loopStartSec
 
+    // Host snap-to-grid: quantize the dragged edge's absolute time to the
+    // nearest grid line while the drag is live — the edge holds still until
+    // the virtual (pointer-follow) position crosses halfway to the next
+    // line, then jumps to it. Applied AFTER the loop-seam magnet, matching
+    // the order the host uses on commit (snapResizedClip), so the released
+    // edge lands exactly where the live preview showed it.
+    const gridSnap = this.ownerPlugin?.snapConfig
+    const gridSec =
+      gridSnap?.enabled && gridSnap.gridSeconds > 0 ? gridSnap.gridSeconds : 0
+
     if (side === 'start') {
       this.dragVirtualStart =
         (this.dragVirtualStart ?? this.startTime) + deltaSeconds
@@ -569,6 +579,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           snapThresholdSec,
         )
         if (snapped != null && snapped >= 0) targetStart = snapped
+      }
+      if (gridSec > 0) {
+        targetStart = Math.round(targetStart / gridSec) * gridSec
       }
       let stepDelta = targetStart - this.startTime
       let newStart = this.startTime + stepDelta
@@ -607,6 +620,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           snapThresholdSec,
         )
         if (snapped != null && snapped > 0.01) newDuration = snapped
+      }
+      if (gridSec > 0) {
+        // Snap the END time (start + duration) — the dragged edge — to the
+        // grid, like the host's commit-time snapResizedClip. Snapping the
+        // duration instead would land off-grid whenever the start is.
+        const snappedEnd =
+          Math.round((this.startTime + newDuration) / gridSec) * gridSec
+        newDuration = snappedEnd - this.startTime
       }
       if (trimMode) {
         const offset = (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec
