@@ -819,7 +819,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     const sampleRate = this.options.audioContext?.sampleRate || 44100
 
-    // Trim front of recording to compensate for round-trip latency
+    // Trim front of recording to compensate for round-trip latency. The trim
+    // alone IS the full compensation — the recording keeps its original
+    // timeline anchor (punchInTimeSec / punchInSample), so the content shifts
+    // earlier by exactly compensationMs. Do NOT also move punchInSample back:
+    // that would apply the shift twice on the stitch path.
     const compensationMs = this.recordingCompensationMs
     if (compensationMs > 0 && rawRecordedPcm[0].length > 1) {
       const samplesToTrim = Math.min(
@@ -828,9 +832,6 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       )
       if (samplesToTrim > 0) {
         rawRecordedPcm = rawRecordedPcm.map((ch) => ch.slice(samplesToTrim))
-        if (this.punchInSample !== null) {
-          this.punchInSample = Math.max(0, this.punchInSample - samplesToTrim)
-        }
       }
     }
 
