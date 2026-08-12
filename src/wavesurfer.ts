@@ -383,6 +383,15 @@ class WaveSurfer extends Player<WaveSurferEvents> {
       // Create new decoded data buffer from peaks and duration
       this.decodedData = Decoder.createBuffer(options.peaks, options.duration)
     }
+    // Lift the player's duration BEFORE the renderer re-render: the render
+    // synchronously emits 'redraw', whose listeners (TimelinePlugin gridlines)
+    // read getEffectiveDuration() — with a stale player lift, a SHRINK makes
+    // max(getDuration(), projectDuration) return the old larger value while
+    // the wrapper is already sized for the new one, so gridlines lay out at
+    // the wrong px-per-sec and stay wrong until the next redraw.
+    if (options.projectDuration != null) {
+      this.propagateProjectDuration()
+    }
     this.renderer.setOptions(this.options)
 
     if (options.audioRate) {
@@ -390,9 +399,6 @@ class WaveSurfer extends Player<WaveSurferEvents> {
     }
     if (options.mediaControls != null) {
       this.getMediaElement().controls = options.mediaControls
-    }
-    if (options.projectDuration != null) {
-      this.propagateProjectDuration()
     }
   }
 

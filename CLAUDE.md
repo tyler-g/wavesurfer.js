@@ -30,7 +30,9 @@ WaveSurfer renders inside a shadow root (`src/renderer.ts`). External CSS **cann
 
 ## Project duration lift
 
-`WebAudioPlayer.setProjectDuration(seconds)` lifts the player's logical `duration` to `max(real audio duration, projectDuration)`. Wavesurfer propagates it automatically from `setOptions({ projectDuration })` and at the end of every `loadAudio` (`propagateProjectDuration()`) — hosts never call it directly. This is what lets a track whose buffer (e.g. Wavvy's silent placeholder) is shorter than the project keep advancing `currentTime`, not self-pause at the buffer end, and accept play/seek positions up to the timeline end. Rationale + host-side rules: wavvy's `docs/architecture/master-transport.md` ("Project duration lift").
+`WebAudioPlayer.setProjectDuration(seconds)` lifts the player's logical `duration` to `max(real audio duration, projectDuration)`. Wavesurfer propagates it automatically from `setOptions({ projectDuration })` and at the end of every `loadAudio` (`propagateProjectDuration()`) — hosts never call it directly.
+
+**Propagation-order invariant (2026-08-12)**: in `setOptions`, `propagateProjectDuration()` must run **BEFORE** `renderer.setOptions(...)`. The renderer re-render synchronously emits `render` → wavesurfer re-emits `redraw`, and redraw listeners (TimelinePlugin gridline layout) read `getEffectiveDuration()` = `max(getDuration(), options.projectDuration)`. With a stale player lift, a projectDuration **shrink** (e.g. Wavvy's post-recording shrink-back) makes that read return the old larger duration while the wrapper is already sized for the new one — gridlines lay out at a compressed px-per-sec and stay misaligned until the next redraw (zoom). Regression test: `src/__tests__/project-duration-propagation.test.ts`. This is what lets a track whose buffer (e.g. Wavvy's silent placeholder) is shorter than the project keep advancing `currentTime`, not self-pause at the buffer end, and accept play/seek positions up to the timeline end. Rationale + host-side rules: wavvy's `docs/architecture/master-transport.md` ("Project duration lift").
 
 **Renderer data-extent invariant**: waveform data is drawn at `audioDuration × pxPerSec`, never stretched across the (wider) projectDuration-based wrapper. `render` / `renderMultiCanvas` / `renderUpdate` all slice channel data against `dataWidth`/`dataTotal`, boundary tiles are drawn narrower, and tiles beyond the audio collapse to width 0. Do not reintroduce `offset / totalWidth` slicing — it draws the live-recording waveform ahead of the cursor whenever the project outgrows the recording buffer.
 
@@ -38,7 +40,7 @@ WaveSurfer renders inside a shadow root (`src/renderer.ts`). External CSS **cann
 
 ## TimelinePlugin
 
-Has a `gridSubdivision` option and `setGridSubdivision()` method for variable grid density — used by Wavvy's per-track gridlines.
+Has a `gridSubdivision` option and `setGridSubdivision()` method for variable grid density — used by Wavvy's per-track gridlines. Gridlines/notches are laid out in **absolute px** once per `redraw` event, at `wrapper.scrollWidth / getEffectiveDuration()` — they do NOT track later width/duration changes, so anything that changes either value must end in a redraw that fires with both already consistent (see "Propagation-order invariant" above).
 
 ## ClipsPlugin drag ghost
 
