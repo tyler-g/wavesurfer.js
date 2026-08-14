@@ -147,6 +147,23 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   // Generation counter to detect stale onstop handlers from previous recordings
   private recordingGeneration: number = 0
 
+  /**
+   * Optional app-injected async renderer for the destructive edit pipeline.
+   * When set (wavvy injects its worker-backed Signalsmith renderer at boot),
+   * recomputeAndReload/previewEffectOnRegion render through it off the main
+   * thread; when null the internal synchronous pipeline runs unchanged (the
+   * standalone-library fallback).
+   */
+  private static effectiveAudioRenderer:
+    | ((pcm: Float32Array[], edits: AudioEdit[], sampleRate: number) => Promise<Float32Array[]>)
+    | null = null
+
+  public static setEffectiveAudioRenderer(
+    fn: ((pcm: Float32Array[], edits: AudioEdit[], sampleRate: number) => Promise<Float32Array[]>) | null
+  ) {
+    RecordPlugin.effectiveAudioRenderer = fn
+  }
+
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
     super({
@@ -1083,11 +1100,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
    * Temporarily appends the edit, runs computeEffectiveAudio, restores edits,
    * and returns just the selected region's PCM data.
    */
-  public previewEffectOnRegion(
+  public async previewEffectOnRegion(
     startTime: number,
     endTime: number,
     edit: Omit<AudioEdit, 'id' | 'startSample' | 'endSample'>
-  ): { pcm: Float32Array[]; sampleRate: number } | null {
+  ): Promise<{ pcm: Float32Array[]; sampleRate: number } | null> {
     if (!this.originalPcm) return null
 
     const startEdited = Math.floor(startTime * this.pcmSampleRate)
@@ -1110,10 +1127,13 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.edits = [...savedEdits, previewEdit]
 
     // Compute the full effective audio with the preview edit
-    const effectivePcm = this.computeEffectiveAudio()
-
-    // Restore edits
-    this.edits = savedEdits
+    let effectivePcm: Float32Array[]
+    try {
+      effectivePcm = await this.renderEffectiveAudioAsync()
+    } finally {
+      // Restore edits
+      this.edits = savedEdits
+    }
 
     if (effectivePcm.length === 0 || effectivePcm[0].length === 0) return null
 
@@ -1817,12 +1837,26 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
-  public recomputeAndReload() {
+  private async renderEffectiveAudioAsync(): Promise<Float32Array[]> {
+    const renderer = RecordPlugin.effectiveAudioRenderer
+    if (renderer && this.originalPcm) {
+      const sampleRate =
+        this.pcmSampleRate || this.options.audioContext?.sampleRate || 44100
+      try {
+        return await renderer(this.originalPcm, this.edits, sampleRate)
+      } catch (_e) {
+        // Injected renderer failed — fall through to the sync pipeline.
+      }
+    }
+    return this.computeEffectiveAudio()
+  }
+
+  public async recomputeAndReload() {
     if (!this.originalPcm || !this.wavesurfer) return
 
     this.emit('processing-start' as any)
 
-    const effectivePcm = this.computeEffectiveAudio()
+    const effectivePcm = await this.renderEffectiveAudioAsync()
     if (effectivePcm[0].length > 0) {
       // Preserve cursor position, zoom, and scroll across reload
       const currentTime = this.wavesurfer.getCurrentTime()
