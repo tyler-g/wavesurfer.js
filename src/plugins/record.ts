@@ -1112,10 +1112,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const startOriginal = this.editedToOriginal(startEdited)
     const endOriginal = this.editedToOriginal(endEdited)
 
-    // Save current edits
-    const savedEdits = [...this.edits]
-
-    // Append the preview edit
+    // The preview edit is passed to the renderer as a caller-owned list —
+    // this.edits is NEVER mutated here. Assigning it across the await let two
+    // overlapping previews interleave their save/restore and leave a phantom
+    // id:'preview' edit in persisted (and peer-synced) track state.
     const previewEdit: AudioEdit = {
       ...edit,
       id: 'preview',
@@ -1124,16 +1124,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       startTime,
       endTime,
     }
-    this.edits = [...savedEdits, previewEdit]
 
-    // Compute the full effective audio with the preview edit
-    let effectivePcm: Float32Array[]
-    try {
-      effectivePcm = await this.renderEffectiveAudioAsync()
-    } finally {
-      // Restore edits
-      this.edits = savedEdits
-    }
+    // Compute the full effective audio with the preview edit appended
+    const effectivePcm = await this.renderEffectiveAudioAsync([...this.edits, previewEdit])
 
     if (effectivePcm.length === 0 || effectivePcm[0].length === 0) return null
 
@@ -1837,18 +1830,37 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recomputeAndReload()
   }
 
-  private async renderEffectiveAudioAsync(): Promise<Float32Array[]> {
+  /**
+   * Render the effective audio for an edit list — the injected async renderer
+   * when one is set, else the internal synchronous pipeline.
+   *
+   * `edits` defaults to this.edits but may be a caller-owned list (preview).
+   * Callers must NEVER assign this.edits around an await to pass a temporary
+   * edit list: two overlapping previews would then interleave their
+   * save/restore and permanently leak a phantom edit into track state (it is
+   * persisted via getEdits() and synced to peers). The only mutation of
+   * this.edits here brackets the SYNCHRONOUS computeEffectiveAudio() call,
+   * which reads this.edits and has no await inside the bracket.
+   */
+  private async renderEffectiveAudioAsync(edits: AudioEdit[] = this.edits): Promise<Float32Array[]> {
     const renderer = RecordPlugin.effectiveAudioRenderer
     if (renderer && this.originalPcm) {
       const sampleRate =
         this.pcmSampleRate || this.options.audioContext?.sampleRate || 44100
       try {
-        return await renderer(this.originalPcm, this.edits, sampleRate)
+        return await renderer(this.originalPcm, edits, sampleRate)
       } catch (_e) {
         // Injected renderer failed — fall through to the sync pipeline.
       }
     }
-    return this.computeEffectiveAudio()
+    if (edits === this.edits) return this.computeEffectiveAudio()
+    const savedEdits = this.edits
+    this.edits = edits
+    try {
+      return this.computeEffectiveAudio()
+    } finally {
+      this.edits = savedEdits
+    }
   }
 
   public async recomputeAndReload() {

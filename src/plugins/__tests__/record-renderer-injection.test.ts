@@ -80,7 +80,7 @@ describe('RecordPlugin effective-audio renderer injection', () => {
     expect(calledPcm[0].length).toBe(2)
   })
 
-  it('previewEffectOnRegion awaits an injected renderer and restores edits afterward', async () => {
+  it('previewEffectOnRegion awaits an injected renderer without touching this.edits', async () => {
     const { plugin } = createPlugin()
     const savedEdits = [...(plugin as any).edits]
     const rendered = [new Float32Array([0.25, 0.25, 0.25])]
@@ -93,8 +93,48 @@ describe('RecordPlugin effective-audio renderer injection', () => {
     // The preview edit must be visible to the renderer call...
     const editsArgAtCallTime = renderer.mock.calls[0][1]
     expect(editsArgAtCallTime.some((e: any) => e.id === 'preview')).toBe(true)
-    // ...but edits must be restored to the pre-preview state afterward.
+    // ...but must never have been written into the plugin's own edit list.
     expect((plugin as any).edits).toEqual(savedEdits)
+    expect((plugin as any).edits.some((e: any) => e.id === 'preview')).toBe(false)
     expect(result).not.toBeNull()
+  })
+
+  it('overlapping previews never leak a phantom preview edit into this.edits', async () => {
+    const { plugin } = createPlugin()
+    const savedEdits = [...(plugin as any).edits]
+    const rendered = [new Float32Array([0.25, 0.25, 0.25])]
+
+    // Renderer that only settles when we say so, so the two previews overlap.
+    const resolvers: Array<() => void> = []
+    const renderer = jest.fn(
+      (_pcm: Float32Array[], _edits: any[], _sampleRate: number) =>
+        new Promise<Float32Array[]>((resolve) => {
+          resolvers.push(() => resolve(rendered))
+        }),
+    )
+    RecordPlugin.setEffectiveAudioRenderer(renderer)
+
+    const first = plugin.previewEffectOnRegion(0, 0.00002, { type: 'amplify', gain: 3 })
+    const second = plugin.previewEffectOnRegion(0, 0.00002, { type: 'amplify', gain: 6 })
+
+    // Both are in flight — the plugin's edit list is untouched meanwhile.
+    expect(renderer).toHaveBeenCalledTimes(2)
+    expect((plugin as any).edits).toEqual(savedEdits)
+
+    // Each call saw its own preview edit, exactly one.
+    for (const call of renderer.mock.calls) {
+      const editsArg = call[1] as any[]
+      expect(editsArg.filter((e) => e.id === 'preview').length).toBe(1)
+    }
+
+    // Settle out of order (the pre-fix save/restore leaked on this ordering).
+    resolvers[0]()
+    resolvers[1]()
+    await first
+    await second
+
+    expect((plugin as any).edits).toEqual(savedEdits)
+    expect((plugin as any).edits.some((e: any) => e.id === 'preview')).toBe(false)
+    expect(plugin.getEdits().some((e: any) => e.id === 'preview')).toBe(false)
   })
 })
