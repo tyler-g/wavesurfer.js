@@ -584,7 +584,14 @@ class WaveSurfer extends Player<WaveSurferEvents> {
    *  Updates the waveform data, cursor position, and scroll in a single efficient call. */
   public updatePeaks(channelData: WaveSurferOptions['peaks'], duration: number, currentTime?: number) {
     if (!channelData) return
-    this.decodedData = Decoder.createBuffer(channelData, duration)
+    // skipNormalization: channelData is the record plugin's LIVE dataWindow —
+    // createBuffer's normalize() mutates in place, and re-normalizing the
+    // same live array on every 10ms tick re-divides it whenever a peak
+    // exceeds 1 (e.g. several sources summed into the capture bus), eroding
+    // previously drawn peaks by a different factor per tick phase. That made
+    // simultaneously recorded tracks render DIFFERENT waveforms from
+    // identical data.
+    this.decodedData = Decoder.createBuffer(channelData, duration, true)
 
     // Update media duration for WebAudioPlayer
     const media = this.getMediaElement()

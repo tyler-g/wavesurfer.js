@@ -38,6 +38,14 @@ WaveSurfer renders inside a shadow root (`src/renderer.ts`). External CSS **cann
 
 **Lift-feedback trap**: code that wants the *audio's* duration must use `getDecodedData()?.duration`, not `getDuration()` (lifted). `record.ts` `processPcmData` clip-mode cleanup does this; so does wavvy's `updateProjectDuration`.
 
+## Decoder normalization is IN-PLACE
+
+`Decoder.createBuffer` normalizes >1 peaks by MUTATING the caller's arrays. Never feed it a live, long-lived buffer without `skipNormalization = true` (third arg) or a copy — `updatePeaks` passes the record plugin's live `dataWindow` every 10ms tick, and repeated in-place normalization eroded drawn peaks by a different factor per tick phase (same-input recording tracks rendered different waveforms from identical data; fixed 2026-08-30). Guard: `src/__tests__/decoder-normalize.test.ts`.
+
+## RecordPlugin capture anchor
+
+`setCaptureAnchor(ctxTime)` anchors a take to the AudioContext clock: merged PCM (`src/record-align.ts` `mergeChunksToAnchor`) is trimmed/padded so sample 0 ≡ the anchor, and the live-waveform edge + duration clock derive from `ctx.currentTime − anchor` instead of wall-clock timers. `pushPcmChunk(chunk, startCtxTime?)` carries the chunk's audio-clock timestamp. `startRecording()` clears the anchor — hosts set it per take, AFTER startRecording, once the transport's `playAt` time is known. In anchored mode the live waveform is drawn from the timestamped chunks (`accumulateChunkPeaks`), NOT the analyser — same-input recorders render identical waveforms. The `expectCaptureAnchor` option holds elapsed/waveform at 0 until the anchor lands (no wall-clock snap-back in the pre-anchor window). This is what keeps simultaneously recorded wavvy tracks sample-aligned; see wavvy's `docs/architecture/master-transport.md` "Recording capture anchor".
+
 ## TimelinePlugin
 
 Has a `gridSubdivision` option and `setGridSubdivision()` method for variable grid density — used by Wavvy's per-track gridlines. Gridlines/notches are laid out in **absolute px** once per `redraw` event, at `wrapper.scrollWidth / getEffectiveDuration()` — they do NOT track later width/duration changes, so anything that changes either value must end in a redraw that fires with both already consistent (see "Propagation-order invariant" above).

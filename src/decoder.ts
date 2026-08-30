@@ -24,13 +24,21 @@ function normalize<T extends Array<Float32Array | number[]>>(channelData: T): T 
   return channelData
 }
 
-/** Create an audio buffer from pre-decoded audio data */
-function createBuffer(channelData: Array<Float32Array | number[]>, duration: number): AudioBuffer {
+/** Create an audio buffer from pre-decoded audio data.
+ *  `skipNormalization` leaves the caller's arrays untouched — REQUIRED for
+ *  live views over long-lived buffers (the record plugin's dataWindow):
+ *  normalize() mutates IN PLACE, so re-wrapping a live window on every
+ *  update tick would re-divide the same array each time a peak exceeds 1. */
+function createBuffer(
+  channelData: Array<Float32Array | number[]>,
+  duration: number,
+  skipNormalization = false,
+): AudioBuffer {
   // If a single array of numbers is passed, make it an array of arrays
   if (typeof channelData[0] === 'number') channelData = [channelData as unknown as number[]]
 
-  // Normalize to -1..1
-  normalize(channelData)
+  // Normalize to -1..1 (mutates channelData in place)
+  if (!skipNormalization) normalize(channelData)
 
   return {
     duration,

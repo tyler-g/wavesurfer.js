@@ -5,6 +5,7 @@
 import BasePlugin, { type BasePluginEvents } from '../base-plugin.js'
 import Timer from '../timer.js'
 import type { WaveSurferOptions } from '../wavesurfer.js'
+import { mergeChunksToAnchor, accumulateChunkPeaks, type TimedPcmChunk } from '../record-align.js'
 
 export type RecordPluginOptions = {
   /** The MIME type to use when recording audio */
@@ -19,6 +20,11 @@ export type RecordPluginOptions = {
   scrollingWaveformWindow?: number
   /** Accumulate and render the waveform data as the audio is being recorded, false by default */
   continuousWaveform?: boolean
+  /** Host will call setCaptureAnchor() for every take (after startRecording).
+   *  Until the anchor lands, elapsed time reads 0 and the live waveform holds
+   *  at the punch-in point — prevents the cursor/waveform running on wall
+   *  clocks during the pre-transport window. */
+  expectCaptureAnchor?: boolean
   /** The duration of the continuous waveform, in seconds */
   continuousWaveformDuration?: number
   /** The timeslice to use for the media recorder */
@@ -143,7 +149,14 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private recordingChannels: number = 1
 
   // PCM chunks accumulated during recording (pushed from external PCM pipeline)
-  private recordedChunksPCM: Float32Array[] = []
+  private recordedChunksPCM: TimedPcmChunk[] = []
+  /** AudioContext-clock time the take is anchored to (the transport's playWhen).
+   *  There is ONE master clock: when set, sample 0 of the merged take ≡ this
+   *  ctx time ≡ punchInTimeSec on the timeline, and the live-waveform edge +
+   *  duration clock are derived from the same anchor instead of wall-clock
+   *  timers. Cleared by startRecording() — the host sets it per take, after
+   *  the transport start time is known. */
+  private captureAnchorCtxTime: number | null = null
   // Generation counter to detect stale onstop handlers from previous recordings
   private recordingGeneration: number = 0
 
@@ -182,8 +195,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     this.subscriptions.push(
       this.timer.on('tick', () => {
-        const currentTime = performance.now() - this.lastStartTime
-        this.duration = this.isPaused() ? this.duration : this.lastDuration + currentTime
+        this.duration = this.isPaused() ? this.duration : this.computeElapsedMs()
         this.emit('record-progress', this.duration)
       }),
     )
@@ -203,9 +215,36 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.recordingChannels = channels
   }
 
-  /** Push a PCM chunk from the external audio pipeline (called by MasterSlice). */
-  public pushPcmChunk(chunk: Float32Array) {
-    this.recordedChunksPCM.push(chunk)
+  /** Push a PCM chunk from the external audio pipeline (called by MasterSlice).
+   *  `startCtxTime` is the AudioContext-clock time of the chunk's first frame
+   *  (stamped in the pcm-processor worklet); required for anchored alignment. */
+  public pushPcmChunk(chunk: Float32Array, startCtxTime?: number) {
+    this.recordedChunksPCM.push({ data: chunk, time: startCtxTime })
+  }
+
+  /** Anchor this take to the transport's start time on the AudioContext clock.
+   *  Must be set AFTER startRecording() (which clears it for the new take). */
+  public setCaptureAnchor(ctxTime: number | null) {
+    this.captureAnchorCtxTime = ctxTime
+  }
+
+  /** Elapsed recording time in ms. Anchored takes read the shared AudioContext
+   *  clock — the same clock the transport and cursor run on — and clamp to 0
+   *  while the transport hasn't started yet. Unanchored takes keep the legacy
+   *  wall-clock timer. */
+  private computeElapsedMs(): number {
+    const ctx = this.options.audioContext
+    if (this.captureAnchorCtxTime !== null && ctx) {
+      return Math.max(0, (ctx.currentTime - this.captureAnchorCtxTime) * 1000)
+    }
+    // Anchor promised but not yet set (the pre-transport window between
+    // startRecording and the host learning the transport's start time):
+    // hold at 0 rather than running a wall clock that would snap back.
+    if (this.options.expectCaptureAnchor && this.isRecording()) return 0
+    // Outside an active recording (mic monitoring) the legacy timer fields are
+    // stale — report the last known duration like getDuration() always did.
+    if (!this.isRecording()) return this.duration
+    return this.lastDuration + (performance.now() - this.lastStartTime)
   }
 
   public renderMicStream(stream: MediaStream): MicStream {
@@ -221,6 +260,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const dataArray = new Float32Array(bufferLength)
 
     let sampleIdx = 0
+    let baseIdx = 0
+    let chunkCursor = 0
     let hasInitialRender = false
 
     if (this.wavesurfer) {
@@ -303,24 +344,52 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
             // Start writing live data from the punch-in position
             sampleIdx = Math.round(this.punchInSample / samplesPerPeak)
           }
+          baseIdx = sampleIdx
         }
 
-        let maxValue = 0
-        for (let i = 0; i < bufferLength; i++) {
-          const value = Math.abs(dataArray[i])
-          if (value > maxValue) {
-            maxValue = value
+        const anchor = this.captureAnchorCtxTime
+        if (anchor !== null) {
+          // Anchored take: fold the timestamped PCM chunks into audio-clock
+          // cells. Both the amplitude and the placement of every peak derive
+          // from the shared chunk stream — NOT from this recorder's analyser
+          // or timer phase — so all recorders of the same input render the
+          // IDENTICAL waveform, exactly aligned with the master transport.
+          const res = accumulateChunkPeaks({
+            dataWindow: this.dataWindow,
+            chunks: this.recordedChunksPCM,
+            fromChunk: chunkCursor,
+            anchorSec: anchor,
+            baseIdx,
+            sampleRate: audioContext.sampleRate,
+            channels: this.recordingChannels,
+            fps: FPS,
+          })
+          this.dataWindow = res.dataWindow
+          chunkCursor = res.nextChunk
+          if (res.maxCellWritten >= 0) sampleIdx = Math.max(sampleIdx, res.maxCellWritten + 1)
+        } else if (this.options.expectCaptureAnchor && this.isRecording()) {
+          // Anchor promised but not yet set — hold; the chunks buffered in
+          // the meantime are folded in (and pre-anchor ones skipped) once
+          // the host anchors the take.
+        } else {
+          // Legacy unanchored mode: one analyser peak per interval tick.
+          let maxValue = 0
+          for (let i = 0; i < bufferLength; i++) {
+            const value = Math.abs(dataArray[i])
+            if (value > maxValue) {
+              maxValue = value
+            }
           }
-        }
 
-        if (sampleIdx + 1 > this.dataWindow.length) {
-          const tempArray = new Float32Array(this.dataWindow.length * 2)
-          tempArray.set(this.dataWindow, 0)
-          this.dataWindow = tempArray
-        }
+          if (sampleIdx + 1 > this.dataWindow.length) {
+            const tempArray = new Float32Array(this.dataWindow.length * 2)
+            tempArray.set(this.dataWindow, 0)
+            this.dataWindow = tempArray
+          }
 
-        this.dataWindow[sampleIdx] = maxValue
-        sampleIdx++
+          this.dataWindow[sampleIdx] = maxValue
+          sampleIdx++
+        }
       } else {
         this.dataWindow = dataArray
       }
@@ -331,12 +400,15 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
         const duration = this.options.scrollingWaveform ? this.options.scrollingWaveformWindow : totalDuration
 
         if (!hasInitialRender) {
-          // First frame: full load to set up DOM structure, events, media
+          // First frame: full load to set up DOM structure, events, media.
+          // Pass a COPY — load() → createBuffer normalizes channelData in
+          // place, and the live dataWindow must never be rescaled (see
+          // updatePeaks' skipNormalization note in wavesurfer.ts).
           this.wavesurfer
-            .load('', [this.dataWindow], duration)
+            .load('', [this.dataWindow.slice()], duration)
             .then(() => {
               if (this.wavesurfer && this.options.continuousWaveform) {
-                this.wavesurfer.setTime(this.punchInTimeSec + this.getDuration() / 1000)
+                this.wavesurfer.setTime(this.punchInTimeSec + this.computeElapsedMs() / 1000)
 
                 if (!this.wavesurfer.options.minPxPerSec) {
                   this.wavesurfer.setOptions({
@@ -350,9 +422,11 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
               console.error('Error rendering real-time recording data:', err)
             })
         } else {
-          // Subsequent frames: lightweight update — reuses canvas DOM, no events, no layout thrashing
+          // Subsequent frames: lightweight update — reuses canvas DOM, no events, no layout thrashing.
+          // computeElapsedMs (not this.duration) so an anchored take's cursor reads
+          // the shared AudioContext clock at draw time, matching the master playhead.
           const currentTime = this.options.continuousWaveform
-            ? this.punchInTimeSec + this.getDuration() / 1000
+            ? this.punchInTimeSec + this.computeElapsedMs() / 1000
             : undefined
           this.wavesurfer.updatePeaks([this.dataWindow!], duration || 0, currentTime)
         }
@@ -663,8 +737,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
     this.source = micStream.source
 
-    // Reset PCM chunks for the new recording
+    // Reset PCM chunks + capture anchor for the new recording (the host
+    // re-anchors each take once the transport start time is known)
     this.recordedChunksPCM = []
+    this.captureAnchorCtxTime = null
     const generation = ++this.recordingGeneration
 
     this.dataWindow = null
@@ -799,17 +875,19 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     }
   }
 
-  /** Merge accumulated PCM chunks into per-channel Float32Arrays, de-interleaving stereo if needed. */
+  /** Merge accumulated PCM chunks into per-channel Float32Arrays, de-interleaving stereo if needed.
+   *  Anchored takes are trimmed/padded so sample 0 falls exactly on the capture
+   *  anchor (the transport's start time on the AudioContext clock) — this is
+   *  what keeps simultaneously recorded tracks sample-aligned regardless of
+   *  how far apart their recorders were started on the main thread. */
   private mergePcmChunks(): Float32Array[] {
-    const totalLength = this.recordedChunksPCM.reduce((sum, arr) => sum + arr.length, 0)
-    const merged = new Float32Array(totalLength)
-    let offset = 0
-    for (const chunk of this.recordedChunksPCM) {
-      merged.set(chunk, offset)
-      offset += chunk.length
-    }
-
     const channels = this.recordingChannels
+    const merged = mergeChunksToAnchor(
+      this.recordedChunksPCM,
+      this.captureAnchorCtxTime,
+      this.options.audioContext?.sampleRate || 44100,
+      channels,
+    )
     if (channels > 1) {
       const frameCount = Math.floor(merged.length / channels)
       const result: Float32Array[] = []
@@ -833,6 +911,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
 
     let rawRecordedPcm = this.mergePcmChunks()
     this.recordedChunksPCM = []
+    this.captureAnchorCtxTime = null
 
     const sampleRate = this.options.audioContext?.sampleRate || 44100
 
