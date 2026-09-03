@@ -48,6 +48,8 @@ WaveSurfer renders inside a shadow root (`src/renderer.ts`). External CSS **cann
 
 ## TimelinePlugin
 
+**Beat-space-only law for the beats-mode grid (2026-09-03)**: gridline classification (bar/beat/sub opacity) and pixel placement must derive from **beat indices**, never seconds. Classification: `subdivisionToBeatsFraction(sub)` `{num, den}` rationals (kept in lockstep with `subdivisionToSeconds`, triplets included) — `atBeat ⟺ (i·num) % den === 0`, `atBar ⟺ (i·num) % (4·den) === 0`. Placement: `beatsPos × pxPerBeat` with NO time rounding. The old seconds math (`|time % barDuration| < 0.001` and `Math.round(time*100)/100 × pxPerSec`) made line weights flicker and positions jitter ±1px during a tempo drag at any non-binary-exact tempo — the host's beat-anchored zoom holds px-per-beat constant, and only beat-space math preserves that on screen.
+
 Has a `gridSubdivision` option and `setGridSubdivision()` method for variable grid density — used by Wavvy's per-track gridlines. Gridlines/notches are laid out in **absolute px** once per `redraw` event, at `wrapper.scrollWidth / getEffectiveDuration()` — they do NOT track later width/duration changes, so anything that changes either value must end in a redraw that fires with both already consistent (see "Propagation-order invariant" above).
 
 ## ClipsPlugin drag ghost

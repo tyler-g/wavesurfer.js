@@ -358,13 +358,29 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       const beatDuration = 60 / this.tempo
       const barDuration = beatDuration * 4
       const gridInterval = this.subdivisionToSeconds(this.gridSubdivision, beatDuration, barDuration)
+      // Line-weight classification runs on EXACT integer arithmetic: line i
+      // sits at i·num/den beats, so on-beat ⟺ (i·num) % den === 0 and
+      // on-bar ⟺ (i·num) % (den·4) === 0. The old float test
+      // (|time % barDuration| < 0.001) misclassified lines at any tempo
+      // whose beat length isn't binary-exact, and the misclassification
+      // CHANGED per tempo tick — bar/beat lines visibly flickered in
+      // opacity during a tempo drag even though their pixels never moved.
+      const { num: gNum, den: gDen } = this.subdivisionToBeatsFraction(this.gridSubdivision)
+      // Pixel placement runs in beat space too: beatsPos is tempo-INDEPENDENT
+      // and pxPerBeat is what the host's beat-anchored zoom holds constant,
+      // so offsets are bit-stable across a tempo drag. The old form rounded
+      // time to 10ms before scaling (±5ms × pxPerSec = up to ±1px, landing
+      // differently at every tempo) — gridlines visibly jittered left/right
+      // during a tempo drag even though their true positions never moved.
+      const pxPerBeat = beatDuration * pxPerSec
 
       for (let i = 0; i * gridInterval < duration; i++) {
-        const time = i * gridInterval
-        const offset = (Math.round((time + this.options.timeOffset) * 100) / 100) * pxPerSec
+        const beatsNumerator = i * gNum
+        const beatsPos = beatsNumerator / gDen
+        const offset = beatsPos * pxPerBeat + this.options.timeOffset * pxPerSec
         // Bar lines at full opacity, beat lines at medium, sub-beat at low
-        const atBar = barDuration > 0 && Math.abs(time % barDuration) < 0.001
-        const atBeat = beatDuration > 0 && Math.abs(time % beatDuration) < 0.001
+        const atBar = beatsNumerator % (gDen * 4) === 0
+        const atBeat = beatsNumerator % gDen === 0
         const opacity = atBar ? '1' : atBeat ? '0.4' : '0.18'
         const gridLine = createElement('div', {
           style: {
@@ -386,6 +402,28 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.timelineWrapper.appendChild(timeline)
 
     this.emit('ready')
+  }
+
+  /** Grid subdivision as an exact fraction of a BEAT (num/den). Keep in
+   *  lockstep with subdivisionToSeconds — integer beat math is what keeps
+   *  bar/beat line classification stable across tempos (see the grid loop). */
+  private subdivisionToBeatsFraction(sub: string): { num: number; den: number } {
+    switch (sub) {
+      case '8 Bars': return { num: 32, den: 1 }
+      case '4 Bars': return { num: 16, den: 1 }
+      case '2 Bars': return { num: 8, den: 1 }
+      case '1 Bar': return { num: 4, den: 1 }
+      case '1/2': return { num: 2, den: 1 }
+      case '1/2T': return { num: 4, den: 3 }
+      case '1/4': return { num: 1, den: 1 }
+      case '1/4T': return { num: 2, den: 3 }
+      case '1/8': return { num: 1, den: 2 }
+      case '1/8T': return { num: 1, den: 3 }
+      case '1/16': return { num: 1, den: 4 }
+      case '1/16T': return { num: 1, den: 6 }
+      case '1/32': return { num: 1, den: 8 }
+      default: return { num: 1, den: 1 } // fallback to quarter note
+    }
   }
 
   /** Convert a grid subdivision string to a duration in seconds */
