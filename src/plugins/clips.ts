@@ -1280,11 +1280,16 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
       // Viewport culling: off-screen clips keep their last-painted canvas
       // and skip the work. They'll repaint when they scroll back into
-      // view (the plugin's scroll handler calls renderWaveform for them)
-      // or when an input change dirties the paint state. Custom
-      // renderers (MIDI) opt out since their render is cheap and the
-      // miss cost is hard to reason about.
-      if (!this.renderContent && !this.isInViewport()) return
+      // view (the plugin's scroll handler calls renderWaveform for them —
+      // the short-circuit passes if nothing changed, or repaints if e.g. a
+      // zoom changed dimensions while hidden) or when an input change
+      // dirties the paint state. Custom renderers (MIDI) are culled too
+      // (2026-09-04): their "cheap" render still reallocates a full-clip
+      // canvas + does layout reads, and every zoom step used to repaint
+      // EVERY MIDI clip in the project. A clip mid-resize-drag is exempt —
+      // drag repaint logic must never miss, and the visible range can be
+      // one step stale during a zoom.
+      if (!this.isInViewport() && this.activeResizeSide === null) return
 
       const clipEl = this.element
       if (!clipEl) return

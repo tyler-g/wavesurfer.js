@@ -1,5 +1,15 @@
 /**
  * The Timeline plugin adds timestamps and notches under the waveform.
+ *
+ * Grid lines (the per-track vertical grid Wavvy draws under clips) are
+ * CANVAS-rendered and viewport-culled (2026-09-04): one canvas sized to the
+ * visible scroll window (+margin), repainted from the `scroll` event's own
+ * pixel coordinates and translated into place. The previous implementation
+ * created one DOM div per grid line over the WHOLE project duration on every
+ * `redraw` (a zoom step at 1/32 grid × 300 s × 6 tracks built ~29k divs), and
+ * `virtualAppend` registered one scroll listener per line, each doing a
+ * `clientWidth` read + append/remove — O(lines) forced reflows per scroll.
+ * The canvas path does zero layout reads on scroll and O(visible lines) work.
  */
 
 import BasePlugin, { type BasePluginEvents } from '../base-plugin.js'
@@ -60,6 +70,17 @@ const defaultOptions = {
   },
 }
 
+// Painted-window margin on each side of the viewport (CSS px). Scrolls that
+// stay inside the painted window need no repaint at all — only the (rare)
+// exit repaints and re-translates the canvas.
+const GRID_PAINT_MARGIN = 200
+// Coarsening floor: when a line tier's spacing falls below this many CSS px
+// (extreme zoom-out on a narrow grid), thin the drawn lines by a power-of-2
+// index step. Classification math is untouched (beat-space law) — this only
+// chooses WHICH lines are drawn, and the old DOM version drew an unreadable
+// smear at these densities anyway.
+const GRID_MIN_SPACING_PX = 3
+
 export type TimelinePluginEvents = BasePluginEvents & {
   ready: []
 }
@@ -67,12 +88,18 @@ export type TimelinePluginEvents = BasePluginEvents & {
 class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOptions> {
   private timelineWrapper: HTMLElement
   private gridOverlay: HTMLElement | null = null
+  private gridCanvas: HTMLCanvasElement | null = null
   private unsubscribeNotches: (() => void)[] = []
   protected options: TimelinePluginOptions & typeof defaultOptions
   private gridLinesEnabled: boolean = false
   private gridMode: 'beats' | 'seconds' = 'beats'
   private tempo: number = 120
   private gridSubdivision: string = '1/4'
+  /** Layout snapshot recomputed once per redraw (the ONLY layout read). */
+  private gridLayout: { duration: number; pxPerSec: number } | null = null
+  /** Painted window in timeline CSS px — [from, to) currently on the canvas. */
+  private paintedFrom = 0
+  private paintedTo = 0
 
   constructor(options?: TimelinePluginOptions) {
     super(options || {})
@@ -128,9 +155,33 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
         zIndex: '1',
       },
     })
+    // Vertical grid lines are uniform top-to-bottom, so the canvas backing
+    // store is ONE device pixel tall and CSS-stretched to full height —
+    // repaints never read or depend on the track's height.
+    this.gridCanvas = createElement('canvas', {
+      style: {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        height: '100%',
+        pointerEvents: 'none',
+        willChange: 'transform',
+      },
+    }) as HTMLCanvasElement
+    this.gridOverlay.appendChild(this.gridCanvas)
     wrapper.appendChild(this.gridOverlay)
 
     this.subscriptions.push(this.wavesurfer.on('redraw', () => this.initTimeline()))
+    // ONE scroll subscription per plugin instance (the old per-line
+    // virtualAppend registered one per grid line/notch). The event args carry
+    // the viewport in px — no layout reads here.
+    this.subscriptions.push(
+      this.wavesurfer.on('scroll', (_start, _end, scrollLeft, scrollRight) => {
+        if (!this.gridLinesEnabled) return
+        if (scrollLeft >= this.paintedFrom && scrollRight <= this.paintedTo) return
+        this.paintGrid(scrollLeft, scrollRight)
+      }),
+    )
 
     if (this.wavesurfer?.getDuration() || this.options.duration) {
       this.initTimeline()
@@ -166,6 +217,8 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.unsubscribeNotches = []
     this.timelineWrapper.remove()
     this.gridOverlay?.remove()
+    this.gridOverlay = null
+    this.gridCanvas = null
     super.destroy()
   }
 
@@ -246,21 +299,131 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     }
   }
 
+  /**
+   * Paint the grid lines covering [scrollLeft, scrollRight) plus margin.
+   * Pure canvas work from the cached layout snapshot — no DOM reads.
+   * Positions/classification keep the beat-space-only law (see CLAUDE.md):
+   * exact integer rationals for bar/beat classing, `beatsPos × pxPerBeat`
+   * placement with no time rounding.
+   */
+  private paintGrid(scrollLeft: number, scrollRight: number) {
+    const canvas = this.gridCanvas
+    const layout = this.gridLayout
+    if (!canvas) return
+    if (!this.gridLinesEnabled || !layout || layout.duration <= 0) {
+      this.paintedFrom = 0
+      this.paintedTo = 0
+      canvas.style.display = 'none'
+      return
+    }
+    canvas.style.display = ''
+
+    const { duration, pxPerSec } = layout
+    const totalWidth = duration * pxPerSec
+    const from = Math.max(0, scrollLeft - GRID_PAINT_MARGIN)
+    const to = Math.min(totalWidth, scrollRight + GRID_PAINT_MARGIN)
+    const widthCss = Math.max(0, to - from)
+    const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+    const widthDev = Math.max(1, Math.round(widthCss * dpr))
+    const lineDev = Math.max(1, Math.round(dpr)) // ≈1 CSS px, device-aligned
+
+    if (canvas.width !== widthDev) canvas.width = widthDev
+    if (canvas.height !== 1) canvas.height = 1
+    canvas.style.width = `${widthCss}px`
+    canvas.style.transform = `translateX(${from}px)`
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.clearRect(0, 0, widthDev, 1)
+
+    const color = this.options.gridLinesColor ?? 'rgba(255, 255, 255, 0.12)'
+    ctx.fillStyle = color
+
+    const timeOffsetPx = this.options.timeOffset * pxPerSec
+
+    if (this.gridMode === 'seconds') {
+      const timeInterval = this.options.timeInterval ?? this.defaultTimeInterval(pxPerSec)
+      const spacingPx = timeInterval * pxPerSec
+      if (spacingPx > 0) {
+        const first = Math.max(0, Math.floor((from - timeOffsetPx) / spacingPx))
+        const last = Math.min(Math.ceil(duration / timeInterval), Math.ceil((to - timeOffsetPx) / spacingPx))
+        for (let i = first; i <= last; i++) {
+          if (i * timeInterval >= duration) break
+          const offset = (Math.round((i * timeInterval + this.options.timeOffset) * 100) / 100) * pxPerSec
+          ctx.fillRect(Math.round((offset - from) * dpr), 0, lineDev, 1)
+        }
+      }
+    } else {
+      const beatDuration = 60 / this.tempo
+      // Line-weight classification runs on EXACT integer arithmetic: line i
+      // sits at i·num/den beats, so on-beat ⟺ (i·num) % den === 0 and
+      // on-bar ⟺ (i·num) % (den·4) === 0. Pixel placement runs in beat space
+      // (beatsPos × pxPerBeat, no time rounding) so offsets are bit-stable
+      // across a tempo drag — see the beat-space-only law in CLAUDE.md.
+      const { num: gNum, den: gDen } = this.subdivisionToBeatsFraction(this.gridSubdivision)
+      const pxPerBeat = beatDuration * pxPerSec
+      const spacingPx = (gNum / gDen) * pxPerBeat
+      if (spacingPx > 0) {
+        // Density coarsening: power-of-2 index step so sub-pixel-dense grids
+        // don't paint an opaque smear (power of 2 keeps bar alignment on all
+        // binary subdivisions; triplet grids degrade to a sparse regular
+        // pattern, which is the best any thinning can do there).
+        let step = 1
+        while (spacingPx * step < GRID_MIN_SPACING_PX) step *= 2
+        const totalBeats = duration / beatDuration
+        const maxI = Math.ceil((totalBeats * gDen) / gNum)
+        let first = Math.max(0, Math.floor((from - timeOffsetPx) / (spacingPx * step)) * step)
+        const last = Math.min(maxI, Math.ceil((to - timeOffsetPx) / spacingPx))
+        for (let i = first; i <= last; i += step) {
+          const beatsNumerator = i * gNum
+          const beatsPos = beatsNumerator / gDen
+          if (beatsPos * beatDuration >= duration) break
+          const offset = beatsPos * pxPerBeat + timeOffsetPx
+          // Bar lines at full opacity, beat lines at medium, sub-beat at low
+          const atBar = beatsNumerator % (gDen * 4) === 0
+          const atBeat = beatsNumerator % gDen === 0
+          ctx.globalAlpha = atBar ? 1 : atBeat ? 0.4 : 0.18
+          ctx.fillRect(Math.round((offset - from) * dpr), 0, lineDev, 1)
+        }
+        ctx.globalAlpha = 1
+      }
+    }
+
+    this.paintedFrom = from
+    this.paintedTo = to
+  }
+
   private initTimeline() {
     this.unsubscribeNotches.forEach((unsubscribe) => unsubscribe())
     this.unsubscribeNotches = []
 
     const duration = this.wavesurfer?.getEffectiveDuration() ?? this.options.duration ?? 0
     const pxPerSec = (this.wavesurfer?.getWrapper().scrollWidth || this.timelineWrapper.scrollWidth) / duration
+
+    // Grid: cache the layout snapshot and repaint the visible window.
+    this.gridLayout = duration > 0 && isFinite(pxPerSec) ? { duration, pxPerSec } : null
+    if (this.gridOverlay) {
+      this.gridOverlay.style.display = this.gridLinesEnabled ? '' : 'none'
+    }
+    if (this.wavesurfer) {
+      const scrollLeft = this.wavesurfer.getScroll()
+      this.paintGrid(scrollLeft, scrollLeft + this.wavesurfer.getWidth())
+    }
+
+    // Notch bar: Wavvy's per-track instances run with height 0 (grid only) —
+    // skip building the invisible label DOM entirely (the old code built one
+    // div per notch, plus a scroll listener each, for a 0-height bar).
+    if (this.options.height <= 0) {
+      this.clearChildren(this.timelineWrapper)
+      this.emit('ready')
+      return
+    }
+
     const timeInterval = this.options.timeInterval ?? this.defaultTimeInterval(pxPerSec)
     const primaryLabelInterval = this.options.primaryLabelInterval ?? this.defaultPrimaryLabelInterval(pxPerSec)
     const primaryLabelSpacing = this.options.primaryLabelSpacing
     const secondaryLabelInterval = this.options.secondaryLabelInterval ?? this.defaultSecondaryLabelInterval(pxPerSec)
     const secondaryLabelSpacing = this.options.secondaryLabelSpacing
     const isTop = this.options.insertPosition === 'beforebegin'
-
-    const gridLines = this.gridLinesEnabled
-    const gridLinesColor = this.options.gridLinesColor ?? 'rgba(255, 255, 255, 0.12)'
 
     const timeline = createElement('div', {
       style: {
@@ -307,12 +470,6 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       },
     })
 
-    // Clear grid overlay
-    if (this.gridOverlay) {
-      this.clearChildren(this.gridOverlay)
-      this.gridOverlay.style.display = gridLines ? '' : 'none'
-    }
-
     for (let i = 0, notches = 0; i < duration; i += timeInterval, notches++) {
       const notch = notchEl.cloneNode() as HTMLElement
       const isPrimary =
@@ -335,67 +492,6 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
       const offset = (Math.round((i + this.options.timeOffset) * 100) / 100) * pxPerSec
       notch.style.left = `${offset}px`
       this.virtualAppend(offset, timeline, notch)
-
-      // Add grid line at every notch when in 'seconds' mode
-      if (gridLines && this.gridMode === 'seconds' && this.gridOverlay) {
-        const gridLine = createElement('div', {
-          style: {
-            position: 'absolute',
-            top: '0',
-            left: `${offset}px`,
-            width: '1px',
-            height: '100%',
-            backgroundColor: gridLinesColor,
-            pointerEvents: 'none',
-          },
-        })
-        this.virtualAppend(offset, this.gridOverlay, gridLine)
-      }
-    }
-
-    // Add beat-based grid lines when in 'beats' mode (default)
-    if (gridLines && this.gridMode === 'beats' && this.gridOverlay) {
-      const beatDuration = 60 / this.tempo
-      const barDuration = beatDuration * 4
-      const gridInterval = this.subdivisionToSeconds(this.gridSubdivision, beatDuration, barDuration)
-      // Line-weight classification runs on EXACT integer arithmetic: line i
-      // sits at i·num/den beats, so on-beat ⟺ (i·num) % den === 0 and
-      // on-bar ⟺ (i·num) % (den·4) === 0. The old float test
-      // (|time % barDuration| < 0.001) misclassified lines at any tempo
-      // whose beat length isn't binary-exact, and the misclassification
-      // CHANGED per tempo tick — bar/beat lines visibly flickered in
-      // opacity during a tempo drag even though their pixels never moved.
-      const { num: gNum, den: gDen } = this.subdivisionToBeatsFraction(this.gridSubdivision)
-      // Pixel placement runs in beat space too: beatsPos is tempo-INDEPENDENT
-      // and pxPerBeat is what the host's beat-anchored zoom holds constant,
-      // so offsets are bit-stable across a tempo drag. The old form rounded
-      // time to 10ms before scaling (±5ms × pxPerSec = up to ±1px, landing
-      // differently at every tempo) — gridlines visibly jittered left/right
-      // during a tempo drag even though their true positions never moved.
-      const pxPerBeat = beatDuration * pxPerSec
-
-      for (let i = 0; i * gridInterval < duration; i++) {
-        const beatsNumerator = i * gNum
-        const beatsPos = beatsNumerator / gDen
-        const offset = beatsPos * pxPerBeat + this.options.timeOffset * pxPerSec
-        // Bar lines at full opacity, beat lines at medium, sub-beat at low
-        const atBar = beatsNumerator % (gDen * 4) === 0
-        const atBeat = beatsNumerator % gDen === 0
-        const opacity = atBar ? '1' : atBeat ? '0.4' : '0.18'
-        const gridLine = createElement('div', {
-          style: {
-            position: 'absolute',
-            top: '0',
-            left: `${offset}px`,
-            width: '1px',
-            height: '100%',
-            backgroundColor: gridLinesColor,
-            opacity,
-            pointerEvents: 'none',
-          },
-        })
-        this.virtualAppend(offset, this.gridOverlay, gridLine)
-      }
     }
 
     this.clearChildren(this.timelineWrapper)
@@ -406,7 +502,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
 
   /** Grid subdivision as an exact fraction of a BEAT (num/den). Keep in
    *  lockstep with subdivisionToSeconds — integer beat math is what keeps
-   *  bar/beat line classification stable across tempos (see the grid loop). */
+   *  bar/beat line classification stable across tempos (see paintGrid). */
   private subdivisionToBeatsFraction(sub: string): { num: number; den: number } {
     switch (sub) {
       case '8 Bars': return { num: 32, den: 1 }
