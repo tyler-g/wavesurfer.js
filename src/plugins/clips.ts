@@ -36,6 +36,9 @@ export type ClipsPluginEvents = BasePluginEvents & {
    *  this; it fires 'update' with a side. */
   'clip-drag': [clip: ClipBlockImpl]
   'clip-drag-end': [clip: ClipBlockImpl]
+  /** Continuous per-pointer-move resize; the block's startTime/duration
+   *  already reflect the in-progress edge (no ghost — the element resizes live). */
+  'clip-resize': [clip: ClipBlockImpl, side: 'start' | 'end']
   'clip-resize-end': [clip: ClipBlockImpl, side: 'start' | 'end']
   'clip-clicked': [clip: ClipBlockImpl, e: MouseEvent]
   'clip-dblclick': [clip: ClipBlockImpl, e: MouseEvent]
@@ -491,12 +494,22 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
    * clone look. The tint is applied on every call (idempotent, cheap) so a
    * ghost re-created mid-drag picks it up again.
    */
-  public showDragGhost(startTime: number, peer?: { color: string; label: string }) {
+  public showDragGhost(
+    startTime: number,
+    peer?: { color: string; label: string },
+    duration?: number,
+  ) {
     if (!this.dragGhostEl) this.dragGhostEl = this.buildDragGhost()
     if (!this.dragGhostEl) return
     this.dragTargetTime = Math.max(0, startTime)
     const leftPct = (this.dragTargetTime / this.totalDuration) * 100
     this.dragGhostEl.style.left = `${leftPct}%`
+    // Optional width override — used for a remote peer's in-progress
+    // RESIZE, where the ghost shows the new extent while the real clip stays
+    // at its committed size. Body-drag ghosts keep the clone's width.
+    if (duration != null && duration > 0) {
+      this.dragGhostEl.style.width = `${(duration / this.totalDuration) * 100}%`
+    }
     if (peer) this.applyGhostPeerTint(this.dragGhostEl, peer)
   }
 
@@ -2077,6 +2090,7 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
     clip.on('update', (side) => {
       // Side-less update = body drag; sided updates are resizes
       if (!side) this.emit('clip-drag', clip)
+      else this.emit('clip-resize', clip, side)
     })
     clip.on('update-end', (side) => {
       if (side === 'start' || side === 'end') {
