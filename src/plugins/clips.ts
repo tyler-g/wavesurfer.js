@@ -482,13 +482,56 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     return ghost
   }
 
-  /** Show (creating on first call) the drag ghost at `startTime`. */
-  public showDragGhost(startTime: number) {
+  /**
+   * Show (creating on first call) the drag ghost at `startTime`.
+   *
+   * `peer` tints the ghost for a REMOTE collaborator's in-progress drag:
+   * outline in the peer's identity color plus a small initial badge in the
+   * ghost's top-left corner. Local drags pass no `peer` and keep the neutral
+   * clone look. The tint is applied on every call (idempotent, cheap) so a
+   * ghost re-created mid-drag picks it up again.
+   */
+  public showDragGhost(startTime: number, peer?: { color: string; label: string }) {
     if (!this.dragGhostEl) this.dragGhostEl = this.buildDragGhost()
     if (!this.dragGhostEl) return
     this.dragTargetTime = Math.max(0, startTime)
     const leftPct = (this.dragTargetTime / this.totalDuration) * 100
     this.dragGhostEl.style.left = `${leftPct}%`
+    if (peer) this.applyGhostPeerTint(this.dragGhostEl, peer)
+  }
+
+  /** Peer-colored outline + initial badge on a remote-drag ghost. */
+  private applyGhostPeerTint(ghost: HTMLElement, peer: { color: string; label: string }) {
+    ghost.style.outline = `2px solid ${peer.color}`
+    ghost.style.opacity = '0.6'
+    let badge = ghost.querySelector<HTMLElement>('.ws-clip-ghost-badge')
+    if (!badge) {
+      badge = createElement('div', {
+        class: 'ws-clip-ghost-badge',
+        style: {
+          position: 'absolute',
+          top: '2px',
+          left: '2px',
+          width: '14px',
+          height: '14px',
+          borderRadius: '50%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: '9px',
+          fontWeight: '700',
+          lineHeight: '1',
+          fontFamily: 'system-ui, sans-serif',
+          color: '#fff',
+          pointerEvents: 'none',
+          zIndex: '3',
+        },
+      }) as HTMLElement
+      ghost.appendChild(badge)
+    }
+    badge.style.background = peer.color
+    badge.style.boxShadow = `0 0 0 1px rgba(0,0,0,0.5)`
+    if (badge.textContent !== peer.label) badge.textContent = peer.label
   }
 
   /** Remove the drag ghost and clear drag-preview state. */
