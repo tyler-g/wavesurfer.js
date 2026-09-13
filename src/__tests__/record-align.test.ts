@@ -1,4 +1,4 @@
-import { mergeChunksToAnchor, accumulateChunkPeaks, TimedPcmChunk } from '../record-align.js'
+import { mergeChunksToAnchor, accumulateChunkPeaks, compensationTrimFrames, TimedPcmChunk } from '../record-align.js'
 
 /** Build a mono chunk of sequential values starting at `startValue`. */
 function seq(startValue: number, length: number): Float32Array {
@@ -147,5 +147,95 @@ describe('accumulateChunkPeaks', () => {
     })
     expect(r2.nextChunk).toBe(2)
     expect(r2.dataWindow[5]).toBe(0.5) // max(0.5, 0.3), not overwritten
+  })
+})
+
+describe('compensated preview placement (WVY-590)', () => {
+  // sr 1000, fps 100 → 10 frames per cell; mono 100-frame chunks
+  const SR = 1000
+  const FPS = 100
+
+  /** Mono 100-frame chunks at the given stamps, with one amplitude-1 impulse
+   *  at ctx-clock stamp `impulseSec`. */
+  function stream(times: number[], impulseSec: number, frames = 100, sr = SR): TimedPcmChunk[] {
+    return times.map((time) => {
+      const data = new Float32Array(frames)
+      const f = Math.round((impulseSec - time) * sr)
+      if (f >= 0 && f < frames) data[f] = 1
+      return { data, time }
+    })
+  }
+
+  function committedCell(chunks: TimedPcmChunk[], anchorSec: number, ms: number, baseIdx = 0, sr = SR, fps = FPS) {
+    const merged = mergeChunksToAnchor(chunks, anchorSec, sr, 1)
+    const trimmed = merged.slice(compensationTrimFrames(ms, sr, merged.length))
+    const j = trimmed.indexOf(1)
+    return j < 0 ? -1 : baseIdx + Math.floor((j * fps) / sr)
+  }
+
+  function previewPeaks(chunks: TimedPcmChunk[], anchorSec: number, ms: number, baseIdx = 0, sr = SR, fps = FPS) {
+    return accumulateChunkPeaks({
+      dataWindow: new Float32Array(baseIdx + 64),
+      chunks,
+      fromChunk: 0,
+      anchorSec,
+      baseIdx,
+      sampleRate: sr,
+      channels: 1,
+      fps,
+      trimFrames: compensationTrimFrames(ms, sr),
+    }).dataWindow
+  }
+
+  function previewCell(chunks: TimedPcmChunk[], anchorSec: number, ms: number, baseIdx = 0, sr = SR, fps = FPS) {
+    return Array.from(previewPeaks(chunks, anchorSec, ms, baseIdx, sr, fps)).indexOf(1)
+  }
+
+  it('preview placement equals committed placement for a non-zero trim', () => {
+    const chunks = stream([0, 0.1, 0.2], 0.135)
+    expect(committedCell(chunks, 0, 20)).toBe(11)
+    expect(previewCell(chunks, 0, 20)).toBe(11)
+  })
+
+  it('count-in on: anchor before the first chunk (zero-padded head)', () => {
+    const chunks = stream([0.004, 0.104, 0.204], 0.134)
+    expect(committedCell(chunks, 0, 20)).toBe(11)
+    expect(previewCell(chunks, 0, 20)).toBe(11)
+  })
+
+  it('count-in off: anchor straddles a chunk', () => {
+    const chunks = stream([0, 0.1, 0.2], 0.185)
+    expect(committedCell(chunks, 0.05, 20)).toBe(11)
+    expect(previewCell(chunks, 0.05, 20)).toBe(11)
+  })
+
+  it('punch-in at a non-zero position', () => {
+    const chunks = stream([0, 0.1, 0.2], 0.135)
+    expect(committedCell(chunks, 0, 20, 500)).toBe(511)
+    expect(previewCell(chunks, 0, 20, 500)).toBe(511)
+  })
+
+  it('frames inside the trimmed head are not drawn', () => {
+    const chunks = stream([0, 0.1, 0.2], 0.01)
+    expect(committedCell(chunks, 0, 20)).toBe(-1)
+    expect(previewCell(chunks, 0, 20)).toBe(-1)
+  })
+
+  it('compensationTrimFrames matches the legacy guard', () => {
+    expect(compensationTrimFrames(0, SR)).toBe(0)
+    expect(compensationTrimFrames(-5, SR)).toBe(0)
+    expect(compensationTrimFrames(20, 1000, 1)).toBe(0)
+    expect(compensationTrimFrames(20, 1000, 10)).toBe(9)
+    expect(compensationTrimFrames(20, 48000)).toBe(960)
+  })
+
+  it('half-sample anchor rounds like mergeChunksToAnchor', () => {
+    // fps === sr → one frame per cell, so the cell IS the committed index
+    const straddle = stream([0, 0.1], 0.01)
+    expect(committedCell(straddle, 0.0005, 0, 0, SR, SR)).toBe(9)
+    expect(previewCell(straddle, 0.0005, 0, 0, SR, SR)).toBe(9)
+    const later = stream([0, 0.1], 0.11)
+    expect(committedCell(later, 0.0005, 0, 0, SR, SR)).toBe(109)
+    expect(previewCell(later, 0.0005, 0, 0, SR, SR)).toBe(109)
   })
 })

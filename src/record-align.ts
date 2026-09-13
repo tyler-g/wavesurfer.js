@@ -75,12 +75,33 @@ export interface AccumulatePeaksResult {
 }
 
 /**
- * Fold timestamped PCM chunks into a peaks window at audio-clock-derived
- * cells: a frame at ctx time `t` lands in cell `baseIdx + floor((t − anchor)
- * · fps)`, holding the max absolute amplitude across frames and channels.
- * Pre-anchor frames are skipped. Because cell placement and amplitude both
- * derive from the shared chunk stream (not per-recorder analysers or timer
- * phases), every recorder of the same input renders the IDENTICAL waveform.
+ * Frames the committed take drops from its head to compensate round-trip
+ * latency: `round(ms · sr)`, capped so at least one frame survives, and 0 for
+ * a non-positive `compensationMs` or a take of ≤1 frame. The ONE computation
+ * shared by RecordPlugin's finalize trim and the live preview placement, so the
+ * preview sits exactly where the committed clip lands (WVY-590).
+ */
+export function compensationTrimFrames(
+  compensationMs: number,
+  sampleRate: number,
+  availableFrames = Infinity,
+): number {
+  if (!(compensationMs > 0) || availableFrames <= 1) return 0
+  return Math.min(Math.round((compensationMs / 1000) * sampleRate), availableFrames - 1)
+}
+
+/**
+ * Fold timestamped PCM chunks into a peaks window at the cells their frames
+ * will occupy in the COMMITTED take: a frame's committed index is
+ * `leadFrames + f − trimFrames`, where `leadFrames = −round((anchor − t) · sr)`
+ * negates the exact rounding `mergeChunksToAnchor` applies, and `trimFrames`
+ * is the latency head trim (`compensationTrimFrames`). It lands in cell
+ * `baseIdx + floor(index · fps / sr)` holding the max absolute amplitude
+ * across frames and channels. Frames with a negative index (pre-anchor, or
+ * inside the trimmed head) are skipped. Because cell placement and amplitude
+ * both derive from the shared chunk stream (not per-recorder analysers or
+ * timer phases), every recorder of the same input renders the IDENTICAL
+ * waveform, and it does not move when the take is committed.
  */
 export function accumulateChunkPeaks(opts: {
   dataWindow: Float32Array
@@ -91,8 +112,10 @@ export function accumulateChunkPeaks(opts: {
   sampleRate: number
   channels: number
   fps: number
+  /** Latency head trim in frames (compensationTrimFrames). Default 0. */
+  trimFrames?: number
 }): AccumulatePeaksResult {
-  const { chunks, fromChunk, anchorSec, baseIdx, sampleRate, channels, fps } = opts
+  const { chunks, fromChunk, anchorSec, baseIdx, sampleRate, channels, fps, trimFrames = 0 } = opts
   let { dataWindow } = opts
   let maxCellWritten = -1
 
@@ -100,9 +123,11 @@ export function accumulateChunkPeaks(opts: {
     const { data, time } = chunks[ci]
     if (time === undefined) continue
     const frames = Math.floor(data.length / channels)
+    const leadFrames = -Math.round((anchorSec - time) * sampleRate)
     for (let f = 0; f < frames; f++) {
-      const cell = baseIdx + Math.floor((time - anchorSec + f / sampleRate) * fps)
-      if (cell < baseIdx) continue
+      const offset = leadFrames + f - trimFrames
+      if (offset < 0) continue
+      const cell = baseIdx + Math.floor((offset * fps) / sampleRate)
       let amp = 0
       for (let c = 0; c < channels; c++) {
         const v = Math.abs(data[f * channels + c])

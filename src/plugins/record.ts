@@ -5,7 +5,12 @@
 import BasePlugin, { type BasePluginEvents } from '../base-plugin.js'
 import Timer from '../timer.js'
 import type { WaveSurferOptions } from '../wavesurfer.js'
-import { mergeChunksToAnchor, accumulateChunkPeaks, type TimedPcmChunk } from '../record-align.js'
+import {
+  mergeChunksToAnchor,
+  accumulateChunkPeaks,
+  compensationTrimFrames,
+  type TimedPcmChunk,
+} from '../record-align.js'
 
 export type RecordPluginOptions = {
   /** The MIME type to use when recording audio */
@@ -134,7 +139,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
    *  history entries (which would truncate the undo/redo stack). */
   public isReloading: boolean = false
   /** Milliseconds to trim from the front of each recording to compensate for
-   *  round-trip audio latency (output + input). Set before startRecording(). */
+   *  round-trip audio latency (output + input). Set before startRecording().
+   *  The anchored live preview reads it every tick (same compensationTrimFrames
+   *  as the finalize trim), so it must NOT change mid-take — a mid-take write
+   *  would move both the preview and the committed clip together. */
   public recordingCompensationMs: number = 0
   /** Snapshot of wavesurfer's decodedData captured before recording starts.
    *  Used by undo to restore the track to its pre-recording visual+audio state. */
@@ -363,6 +371,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
             sampleRate: audioContext.sampleRate,
             channels: this.recordingChannels,
             fps: FPS,
+            trimFrames: compensationTrimFrames(this.recordingCompensationMs, audioContext.sampleRate),
           })
           this.dataWindow = res.dataWindow
           chunkCursor = res.nextChunk
@@ -920,15 +929,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     // timeline anchor (punchInTimeSec / punchInSample), so the content shifts
     // earlier by exactly compensationMs. Do NOT also move punchInSample back:
     // that would apply the shift twice on the stitch path.
-    const compensationMs = this.recordingCompensationMs
-    if (compensationMs > 0 && rawRecordedPcm[0].length > 1) {
-      const samplesToTrim = Math.min(
-        Math.round((compensationMs / 1000) * sampleRate),
-        rawRecordedPcm[0].length - 1,
-      )
-      if (samplesToTrim > 0) {
-        rawRecordedPcm = rawRecordedPcm.map((ch) => ch.slice(samplesToTrim))
-      }
+    // The live preview applies the SAME compensationTrimFrames offset (WVY-590).
+    const samplesToTrim = compensationTrimFrames(this.recordingCompensationMs, sampleRate, rawRecordedPcm[0].length)
+    if (samplesToTrim > 0) {
+      rawRecordedPcm = rawRecordedPcm.map((ch) => ch.slice(samplesToTrim))
     }
 
     // Clip mode: emit raw recorded PCM as a standalone clip, skip monolithic stitch
