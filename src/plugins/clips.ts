@@ -11,10 +11,13 @@ import createElement from '../dom.js'
 import {
   computeClipSampleWindow,
   computeContentPixelWidth,
+  computeContentWindow,
   computeLoopSeamTimes,
   snapToGridPoint,
   wrapTileTime,
 } from '../clip-render-math.js'
+import type { ClipContentWindow } from '../clip-render-math.js'
+export type { ClipContentWindow }
 
 export type ClipsPluginOptions =
   | {
@@ -64,12 +67,20 @@ export type ClipBlockEvents = {
  * FRACTIONAL — it is the exact (unrounded) time→pixel scale basis, kept
  * stable across resize-drag repaints; the backing bitmap is the rounded
  * width, so content near the last partial pixel is cropped.
+ *
+ * `window` (WVY-87) is present ONLY for clips created with
+ * `contentWindowed: true`: the canvas then covers just the viewport-visible
+ * slice of the clip (+ scroll margin) and the renderer must map time via
+ * `x = (t - window.startSec) * window.pxPerSecDevice`, ignoring `width`
+ * (which still describes the full clip). Legacy 4-arg renderers are
+ * called exactly as before when the flag is off.
  */
 export type ClipRenderFn = (
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
   clip: ClipBlockImpl,
+  window?: ClipContentWindow,
 ) => void
 
 export type ClipParams = {
@@ -83,6 +94,15 @@ export type ClipParams = {
   selected?: boolean
   /** Custom render function — replaces waveform rendering when provided */
   renderContent?: ClipRenderFn
+  /**
+   * Opt the custom renderer into viewport-windowed canvases (WVY-87). Off
+   * by default: the renderer then gets a full-clip-width canvas exactly as
+   * before. When on, `renderContent` receives a 5th `ClipContentWindow`
+   * argument and MUST position marks from it (see `ClipRenderFn`). The
+   * flag is explicit rather than sniffed from `renderContent.length` —
+   * `Function.length` is not a contract under obfuscation.
+   */
+  contentWindowed?: boolean
   /** Arbitrary data attached to the clip (e.g., MidiNote[] for MIDI clips) */
   data?: any
   /**
@@ -126,6 +146,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   private originalPeaks: number[] | null
   public selected: boolean
   public renderContent: ClipRenderFn | undefined
+  /** See `ClipParams.contentWindowed`. */
+  public contentWindowed: boolean
   public data: any
   public subscriptions: (() => void)[] = []
   private totalDuration: number
@@ -241,6 +263,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.originalPeaks = this.peaks ? [...this.peaks] : null
     this.selected = params.selected ?? false
     this.renderContent = params.renderContent
+    this.contentWindowed = params.contentWindowed ?? false
     this.data = params.data
     this.pcm = params.pcm ?? null
     this.sampleRate = params.sampleRate ?? 44100

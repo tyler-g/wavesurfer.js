@@ -134,6 +134,69 @@ export function computeContentPixelWidth(params: ContentPixelWidthParams): {
 }
 
 /**
+ * Time↔pixel mapping of a WINDOWED custom-content (renderContent) canvas.
+ * Passed to `ClipRenderFn` as its 5th argument when the clip opted in via
+ * `contentWindowed` (WVY-87). Renderers map clip-relative time to canvas
+ * device px as `x = (t - startSec) * pxPerSecDevice` and must ignore the
+ * legacy `contentW` argument (which still describes the FULL clip).
+ */
+export type ClipContentWindow = {
+  /** Clip-relative time (s) at canvas x = 0. Negative during a left-edge
+   *  resize drag (the window extends left of the clip origin). */
+  startSec: number
+  /** Clip-relative time (s) at canvas x = bitmapW. */
+  endSec: number
+  /** Device px per second — EXACT and UNROUNDED (the time→pixel scale). */
+  pxPerSecDevice: number
+  /** Integer bitmap width in device px. */
+  bitmapW: number
+}
+
+export type ContentWindowParams = {
+  /** Clip's timeline start (s). */
+  clipStartTime: number
+  /** Raw (unquantized) canvas window within the clip element, CSS px.
+   *  `canvasLeftCss` may be negative (left-edge drag lead-in). */
+  canvasLeftCss: number
+  canvasWidthCss: number
+  /** Drag-stable CSS px per second (parent timeline width / total duration). */
+  pxPerSecCss: number
+  /** Device pixel ratio (>= 1). */
+  dpr: number
+}
+
+/**
+ * Quantize a content-clip canvas window and derive its time mapping.
+ *
+ * The window POSITION is quantized on the TIMELINE device-pixel grid
+ * (clip timeline position + window offset), NOT clip-relative — the same
+ * law the PCM path follows (see clips.ts renderWaveform). The clip origin
+ * sits at a fractional layout position and moves fractionally during a
+ * left-edge drag; rounding in clip coordinates would re-phase every mark's
+ * antialiasing per repaint. On the timeline grid, two repaints of the same
+ * content are pixel-identical or exact whole-device-pixel translations.
+ *
+ * `pxPerSecDevice` is deliberately unrounded (same reasoning as
+ * `computeContentPixelWidth`): the scale must be exact so a mark at a fixed
+ * time lands on the same pixel every repaint.
+ */
+export function computeContentWindow(
+  params: ContentWindowParams,
+): ClipContentWindow & { canvasLeftCss: number; canvasWidthCss: number } {
+  const { clipStartTime, pxPerSecCss, dpr } = params
+  const clipTimelineLeftCss = clipStartTime * pxPerSecCss
+  const timelineBase = clipTimelineLeftCss + params.canvasLeftCss
+  const canvasLeftCss =
+    Math.round(timelineBase * dpr) / dpr - clipTimelineLeftCss
+  const canvasWidthCss = Math.round(params.canvasWidthCss * dpr) / dpr
+  const bitmapW = Math.max(1, Math.round(canvasWidthCss * dpr))
+  const pxPerSecDevice = pxPerSecCss * dpr
+  const startSec = canvasLeftCss / pxPerSecCss
+  const endSec = startSec + bitmapW / pxPerSecDevice
+  return { startSec, endSec, pxPerSecDevice, bitmapW, canvasLeftCss, canvasWidthCss }
+}
+
+/**
  * Positive-modulo wrap of a (phase-shifted) clip time into a loop tile:
  * returns tileT in [0, loopLen). Guards the floating-point edge where
  * `shifted` sits within one ulp BELOW zero (or below a tile multiple) and

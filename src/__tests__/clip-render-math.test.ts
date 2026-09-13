@@ -1,6 +1,7 @@
 import {
   computeClipSampleWindow,
   computeContentPixelWidth,
+  computeContentWindow,
   computeLoopSeamTimes,
   snapToGridPoint,
   wrapTileTime,
@@ -317,5 +318,117 @@ describe('snapToGridPoint', () => {
 
   test('degenerate step never snaps', () => {
     expect(snapToGridPoint(1, 0, 0, 0.5)).toBeNull()
+  })
+})
+
+describe('computeContentWindow', () => {
+  // Windowed custom-content (renderContent) geometry — WVY-87.
+  const dpr = 2
+  const pxPerSecCss = 200 // 200 CSS px/s
+
+  test('canvas ceiling: a viewport-sized window stays far under 16K where the legacy full-clip width does not', () => {
+    // 600 s clip at 200 px/s, dpr 2. The legacy full-clip bitmap would be
+    // 240 000 device px — past the ~16K browser ceiling, the clip paints
+    // nothing at all. The windowed bitmap covers only the visible range
+    // (+ scroll margin): here a 1400 px viewport + 2×600 px margin.
+    const legacy = computeContentPixelWidth({
+      duration: 600,
+      parentWidthCss: 600 * pxPerSecCss,
+      totalDuration: 600,
+      dpr,
+    })
+    expect(legacy.bitmapW).toBe(240000)
+
+    const win = computeContentWindow({
+      clipStartTime: 0,
+      canvasLeftCss: 40000 - 600,
+      canvasWidthCss: 1400 + 1200,
+      pxPerSecCss,
+      dpr,
+    })
+    expect(win.bitmapW).toBe(5200)
+    expect(win.bitmapW).toBeLessThanOrEqual(16000)
+  })
+
+  test('scale is exact and unrounded; window extent matches the bitmap within 1 px', () => {
+    const win = computeContentWindow({
+      clipStartTime: 12.345,
+      canvasLeftCss: 333.7,
+      canvasWidthCss: 2600.3,
+      pxPerSecCss: 8000 / 60, // parentWidthCss / totalDuration, fractional
+      dpr,
+    })
+    expect(win.pxPerSecDevice).toBe((8000 / 60) * dpr)
+    expect(Math.abs((win.endSec - win.startSec) * win.pxPerSecDevice - win.bitmapW)).toBeLessThan(1)
+    expect(win.bitmapW).toBe(Math.round(win.canvasWidthCss * dpr))
+  })
+
+  test('timeline-grid quantization: windows one device px apart translate by exactly one device px', () => {
+    const base = {
+      clipStartTime: 7.777,
+      canvasWidthCss: 2600,
+      pxPerSecCss,
+      dpr,
+    }
+    const a = computeContentWindow({ ...base, canvasLeftCss: 100.13 })
+    const b = computeContentWindow({ ...base, canvasLeftCss: 100.13 + 1 / dpr })
+    expect(b.startSec * b.pxPerSecDevice - a.startSec * a.pxPerSecDevice).toBeCloseTo(1, 6)
+    // The window origin sits on the TIMELINE device-pixel grid, not the
+    // clip-relative one: timeline position of x=0 is a whole device px.
+    const timelineDevicePx = (base.clipStartTime + a.startSec) * a.pxPerSecDevice
+    expect(timelineDevicePx).toBeCloseTo(Math.round(timelineDevicePx), 6)
+  })
+
+  test('sub-device-pixel window shifts collapse to the SAME window (no sub-pixel re-phase)', () => {
+    // A left-edge drag moves the clip origin fractionally while the
+    // viewport stays put: the clip-relative window left shifts by the
+    // same fraction the origin moved, and the timeline-grid rounding must
+    // land both repaints on the identical timeline device pixel.
+    const startA = 7.777
+    const d = 0.0013 // < half a device px at 200 px/s, dpr 2 (1/400 s)
+    const a = computeContentWindow({
+      clipStartTime: startA,
+      canvasLeftCss: -300,
+      canvasWidthCss: 2600,
+      pxPerSecCss,
+      dpr,
+    })
+    const b = computeContentWindow({
+      clipStartTime: startA - d,
+      canvasLeftCss: -300 + d * pxPerSecCss,
+      canvasWidthCss: 2600,
+      pxPerSecCss,
+      dpr,
+    })
+    // Same timeline window: absolute start time identical.
+    expect(startA + a.startSec).toBeCloseTo(startA - d + b.startSec, 9)
+    expect(a.bitmapW).toBe(b.bitmapW)
+  })
+
+  test('negative window (left-edge drag lead-in): startSec < 0, bounded by timeline zero', () => {
+    const clipStartTime = 2
+    // Caller bounds the window at timeline zero (minLeftCss); with the
+    // window starting exactly there, quantization must not push it past.
+    const win = computeContentWindow({
+      clipStartTime,
+      canvasLeftCss: -clipStartTime * pxPerSecCss,
+      canvasWidthCss: 1000,
+      pxPerSecCss,
+      dpr,
+    })
+    expect(win.startSec).toBeLessThan(0)
+    expect(win.startSec).toBeCloseTo(-clipStartTime, 9)
+    expect(clipStartTime + win.startSec).toBeCloseTo(0, 9)
+  })
+
+  test('degenerate widths clamp to a 1 px bitmap', () => {
+    const win = computeContentWindow({
+      clipStartTime: 0,
+      canvasLeftCss: 0,
+      canvasWidthCss: 0.1,
+      pxPerSecCss,
+      dpr,
+    })
+    expect(win.bitmapW).toBe(1)
   })
 })
