@@ -198,6 +198,10 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public paintLeadInSec = 0
   /** resizeStartDeltaSec at the time the current bitmap was painted. */
   private paintAnchorDeltaSec = 0
+  /** canvas.style.left (CSS px, clip-relative) at the time the current
+   *  bitmap was painted — the slide origin for windowed content clips,
+   *  whose window does not start at `-paintLeadInSec` in general. */
+  private paintCanvasLeftCss = 0
   private rafHandle: number = 0
   /**
    * Snapshot of the inputs that produced the currently-painted canvas.
@@ -769,17 +773,23 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // cancel in the same compositor coordinate space, so the painting is
     // perfectly still on screen. Only a drag past the painted lead-in
     // needs a fresh paint (which re-anchors with a new margin).
-    if (
-      side === 'start' &&
-      this.renderContent &&
-      !this.contentWindowed &&
-      this.lastPaintState
-    ) {
+    // Windowed content clips (WVY-87) slide the same way: their window is
+    // timeline-fixed and already extends `paintLeadInSec` left of the clip
+    // origin (bounded by timeline zero / trim source start / the scroll
+    // margin), so the painted bitmap stays valid until the origin has moved
+    // past the window's left edge — then a repaint re-anchors on the same
+    // timeline device grid (an exact whole-pixel translation, no blink).
+    // The slide origin is the painted canvas left, not `-lead`: a window
+    // can start right of the clip origin (origin off-screen), and then
+    // lead = 0 degrades to per-frame repaints exactly like audio.
+    if (side === 'start' && this.renderContent && this.lastPaintState) {
       const slid = this.resizeStartDeltaSec - this.paintAnchorDeltaSec
       if (slid <= this.paintLeadInSec + 1e-9) {
         const pxPerSecCss = this.stablePxPerSecCss()
         if (pxPerSecCss > 0 && this.canvas) {
-          this.canvas.style.left = `${(slid - this.paintLeadInSec) * pxPerSecCss}px`
+          this.canvas.style.left = this.contentWindowed
+            ? `${this.paintCanvasLeftCss + slid * pxPerSecCss}px`
+            : `${(slid - this.paintLeadInSec) * pxPerSecCss}px`
           return
         }
       }
@@ -830,11 +840,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // authoritative startTime/duration/phase in response, and its sync
     // repaint must not be double-compensated.
     const hadLeadIn = this.paintLeadInSec > 0
-    // Windowed content clips carry the drag delta inside the painted
-    // bitmap (no lead-in): same restore rule applies to them.
+    // Windowed content clips: same restore rule when the painted bitmap
+    // carries a drag delta OR the edge moved (slid) since that paint —
+    // either way the canvas geometry is drag-transient.
     const paintedDragDelta =
       this.contentWindowed &&
-      (this.lastPaintState?.resizeStartDeltaSec ?? 0) !== 0
+      this.lastPaintState != null &&
+      (this.lastPaintState.resizeStartDeltaSec !== 0 ||
+        this.resizeStartDeltaSec !== this.paintAnchorDeltaSec)
     this.resizeStartDeltaSec = 0
     this.dragStartDuration = null
     this.dragStartExtent = 0
@@ -1694,14 +1707,24 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // window's time mapping as a 5th argument. Bitmap width stays
       // viewport-bound at any zoom — the legacy full-clip bitmap silently
       // exceeded the ~16K browser ceiling on an 80 s clip at default zoom
-      // on a 2× display. Left-edge drags repaint per frame here exactly as
-      // audio does: the timeline-grid window makes every repaint a
-      // whole-device-pixel translation of the last, so no slide is needed
-      // for correctness (the legacy slide below is an optimization for the
-      // un-windowed bitmap, whose origin rides the fractional clip origin).
+      // on a 2× display. During a left-edge drag the window's extent left
+      // of the clip origin (negative canvasLeftCss — bounded by timeline
+      // zero, the trim source start and the scroll margin) is recorded as
+      // the lead-in so repaintForResizeDrag can SLIDE the canvas per frame
+      // instead of repainting; a drag past it repaints on the same timeline
+      // device grid — an exact whole-pixel translation, never an AA
+      // re-phase — so no re-anchor quantization is needed here (contrast
+      // the legacy branch below, whose bitmap origin rides the fractional
+      // clip origin). chooseLeadInSec is deliberately not consulted: the
+      // window bounds already are the lead-in bounds.
       if (this.renderContent && this.contentWindowed && contentWindow) {
-        this.paintLeadInSec = 0
+        const pxPerSecCss = contentWindow.pxPerSecDevice / dpr
+        this.paintLeadInSec =
+          this.activeResizeSide === 'start' && canvasLeftCss < 0
+            ? -canvasLeftCss / pxPerSecCss
+            : 0
         this.paintAnchorDeltaSec = this.resizeStartDeltaSec
+        this.paintCanvasLeftCss = canvasLeftCss
         // Legacy-shaped full-clip content width, for renderers migrating
         // incrementally; v2 renderers ignore it (see ClipRenderFn).
         const contentW = Math.max(
