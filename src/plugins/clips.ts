@@ -228,6 +228,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     loopStartSec: number
     loopEndSec: number
     loopPhaseSec: number
+    // Drag-transient inputs of a windowed custom-content paint (WVY-87):
+    // an in-drag frame must never reuse a window painted under a
+    // different edge offset, and the release repaint must not be skipped.
+    resizeStartDeltaSec: number
+    paintLeadInSec: number
   } | null = null
   /** Reference to the owning plugin so the clip can read the shared
    *  visible-time range for viewport culling. */
@@ -764,7 +769,12 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // cancel in the same compositor coordinate space, so the painting is
     // perfectly still on screen. Only a drag past the painted lead-in
     // needs a fresh paint (which re-anchors with a new margin).
-    if (side === 'start' && this.renderContent && this.lastPaintState) {
+    if (
+      side === 'start' &&
+      this.renderContent &&
+      !this.contentWindowed &&
+      this.lastPaintState
+    ) {
       const slid = this.resizeStartDeltaSec - this.paintAnchorDeltaSec
       if (slid <= this.paintLeadInSec + 1e-9) {
         const pxPerSecCss = this.stablePxPerSecCss()
@@ -820,6 +830,11 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // authoritative startTime/duration/phase in response, and its sync
     // repaint must not be double-compensated.
     const hadLeadIn = this.paintLeadInSec > 0
+    // Windowed content clips carry the drag delta inside the painted
+    // bitmap (no lead-in): same restore rule applies to them.
+    const paintedDragDelta =
+      this.contentWindowed &&
+      (this.lastPaintState?.resizeStartDeltaSec ?? 0) !== 0
     this.resizeStartDeltaSec = 0
     this.dragStartDuration = null
     this.dragStartExtent = 0
@@ -832,7 +847,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // A slid canvas must be restored to normal geometry even if the host
     // commit turns out to be a no-op (below-threshold drag) and never
     // triggers its own repaint.
-    if (hadLeadIn) this.renderWaveform()
+    if (hadLeadIn || paintedDragDelta) this.renderWaveform()
     this.emit('update-end', side)
   }
 
@@ -1409,7 +1424,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       const dragSecPerCssPx = this.secPerCssPx(clipWidthCss)
       if (
         this.activeResizeSide === 'start' &&
-        !this.renderContent &&
+        (!this.renderContent || this.contentWindowed) &&
         dragSecPerCssPx > 0
       ) {
         const pxPerSecCss = 1 / dragSecPerCssPx
@@ -1500,12 +1515,31 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // the release repaint (same startTime), and under scroll — so
       // consecutive repaints are pixel-identical or exact whole-pixel
       // translations, never a sub-pixel re-rasterization.
+      // Windowed custom-content clips (contentWindowed, WVY-87) follow the
+      // same timeline-grid law through computeContentWindow, which also
+      // yields the time mapping handed to the renderer.
+      let contentWindow: ClipContentWindow | null = null
       if (!this.renderContent && dragSecPerCssPx > 0) {
         const pxPerSecCss = 1 / dragSecPerCssPx
         const clipTimelineLeftCss = this.startTime * pxPerSecCss
         const timelineBase = clipTimelineLeftCss + canvasLeftCss
         canvasLeftCss =
           Math.round(timelineBase * dpr) / dpr - clipTimelineLeftCss
+      } else if (
+        this.renderContent &&
+        this.contentWindowed &&
+        dragSecPerCssPx > 0
+      ) {
+        const win = computeContentWindow({
+          clipStartTime: this.startTime,
+          canvasLeftCss,
+          canvasWidthCss,
+          pxPerSecCss: 1 / dragSecPerCssPx,
+          dpr,
+        })
+        canvasLeftCss = win.canvasLeftCss
+        canvasWidthCss = win.canvasWidthCss
+        contentWindow = win
       } else {
         canvasLeftCss = Math.round(canvasLeftCss * dpr) / dpr
       }
@@ -1568,6 +1602,33 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.pcm && (!this.peaksPreLooped || pcmSpansClip)
           ? this.tierForBins(pixelW)
           : 0
+      // Windowed custom-content short-circuit (WVY-87). Content mutations
+      // arrive only through setData/setRenderContent, which null the
+      // snapshot, so window geometry + loop/drag inputs are the full key.
+      // This is what stops every scroll event repainting every visible
+      // MIDI clip: a scroll whose visible range still fits the painted
+      // window reuses it above and matches here.
+      if (
+        contentWindow &&
+        this.lastPaintState &&
+        this.lastPaintState.pixelW === pixelW &&
+        this.lastPaintState.pixelH === pixelH &&
+        this.lastPaintState.duration === this.duration &&
+        this.lastPaintState.originalDuration === this.originalDuration &&
+        this.lastPaintState.clipWidthCss === clipWidthCss &&
+        this.lastPaintState.canvasLeftCss === canvasLeftCss &&
+        this.lastPaintState.canvasWidthCss === canvasWidthCss &&
+        this.lastPaintState.loopEnabled === this.loopEnabled &&
+        this.lastPaintState.loopStartSec === this.loopStartSec &&
+        this.lastPaintState.loopEndSec === this.loopEndSec &&
+        this.lastPaintState.loopPhaseSec === this.loopPhaseSec &&
+        this.lastPaintState.resizeStartDeltaSec === this.resizeStartDeltaSec &&
+        this.lastPaintState.paintLeadInSec === this.paintLeadInSec &&
+        this.canvas.width === pixelW &&
+        this.canvas.height === pixelH
+      ) {
+        return
+      }
       if (
         !this.renderContent &&
         this.lastPaintState &&
@@ -1620,13 +1681,39 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           loopStartSec: this.loopStartSec,
           loopEndSec: this.loopEndSec,
           loopPhaseSec: this.loopPhaseSec,
+          resizeStartDeltaSec: this.resizeStartDeltaSec,
+          paintLeadInSec: this.paintLeadInSec,
         }
       }
 
-      // Custom renderer (MIDI clips) takes precedence. These get the
-      // full-clip canvas (not windowed) because MIDI note positions
-      // are computed against clip coordinates — windowing would require
-      // a protocol update for the render callback.
+      // Custom renderer (MIDI clips) takes precedence.
+      //
+      // Windowed (contentWindowed, WVY-87): the canvas is the same
+      // viewport-sized, timeline-grid-quantized window the PCM path uses
+      // (already positioned + sized above), and the renderer receives the
+      // window's time mapping as a 5th argument. Bitmap width stays
+      // viewport-bound at any zoom — the legacy full-clip bitmap silently
+      // exceeded the ~16K browser ceiling on an 80 s clip at default zoom
+      // on a 2× display. Left-edge drags repaint per frame here exactly as
+      // audio does: the timeline-grid window makes every repaint a
+      // whole-device-pixel translation of the last, so no slide is needed
+      // for correctness (the legacy slide below is an optimization for the
+      // un-windowed bitmap, whose origin rides the fractional clip origin).
+      if (this.renderContent && this.contentWindowed && contentWindow) {
+        this.paintLeadInSec = 0
+        this.paintAnchorDeltaSec = this.resizeStartDeltaSec
+        // Legacy-shaped full-clip content width, for renderers migrating
+        // incrementally; v2 renderers ignore it (see ClipRenderFn).
+        const contentW = Math.max(
+          1,
+          this.duration * contentWindow.pxPerSecDevice,
+        )
+        this.renderContent(ctx, contentW, pixelH, this, contentWindow)
+        persistPaintState()
+        return
+      }
+      // Legacy (un-windowed): full-clip canvas because the 4-arg renderer
+      // positions marks against clip coordinates.
       if (this.renderContent) {
         // Drag-stable geometry: derive the content width from the parent's
         // px/sec (constant during a resize drag) rather than the
