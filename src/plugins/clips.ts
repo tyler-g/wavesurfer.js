@@ -292,6 +292,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
 
     const element = createElement('div', {
       class: 'ws-clip',
+      // Accessibility (WVY-386): the clip was a bare div with no role, name
+      // or selected state. Attributes only — no behavior change. Keep these
+      // in sync in setSelected() / setName().
+      role: 'option',
+      'aria-label': this.name || 'Clip',
+      'aria-selected': this.selected ? 'true' : 'false',
+      // Roving tabindex: only the selected clip is a tab stop.
+      tabindex: this.selected ? '0' : '-1',
       style: {
         position: 'absolute',
         top: '0',
@@ -511,6 +519,14 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     })
     ghost.classList.add('ws-clip-ghost')
     ghost.classList.remove('ws-clip--dragging')
+    // The ghost is a deep clone, so it inherits the clip's ARIA identity
+    // (WVY-386) — strip it: a decorative drag preview must not become a
+    // second announced option or a stray tab stop.
+    ghost.setAttribute('aria-hidden', 'true')
+    ghost.removeAttribute('role')
+    ghost.removeAttribute('tabindex')
+    ghost.removeAttribute('aria-label')
+    ghost.removeAttribute('aria-selected')
     ghost.style.opacity = '0.45'
     ghost.style.pointerEvents = 'none'
     this.element.parentElement.appendChild(ghost)
@@ -1971,6 +1987,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       this.element.style.outline = selected
         ? '2px solid #fff'
         : '2px solid rgba(255,255,255,0.18)'
+      // Keep the ARIA/roving-tabindex state on the option in sync (WVY-386).
+      this.element.setAttribute('aria-selected', selected ? 'true' : 'false')
+      this.element.setAttribute('tabindex', selected ? '0' : '-1')
     }
   }
 
@@ -1986,6 +2005,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (this.element) {
       const label = this.element.querySelector('div') as HTMLElement
       if (label) label.textContent = name
+      // The visible label is inside the clip, but the clip itself carries the
+      // accessible name (WVY-386) — rename must move both.
+      this.element.setAttribute('aria-label', name || 'Clip')
     }
   }
 
@@ -2154,6 +2176,12 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
     this.wrapperEl = wrapper
     this.scrollEl = wrapper.parentElement
     this.container = createElement('div', {
+      // Clips are a selectable set, so the overlay is the listbox that owns
+      // them and each `.ws-clip` is a role="option" (WVY-386). Without the
+      // container role the per-clip option roles would be orphaned and AT
+      // would drop the selected state.
+      role: 'listbox',
+      'aria-label': 'Clips',
       style: {
         position: 'absolute',
         top: '0',
