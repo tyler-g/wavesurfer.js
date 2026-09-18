@@ -829,6 +829,31 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     }
   }
 
+  /** Finalize the take NOW, synchronously, instead of waiting for MediaRecorder's
+   *  stop event (a later task). Used by the host when project state is about to be
+   *  replaced in the same tick — the ordinary onstop would reach a listener React
+   *  has already unmounted (wavvy WVY-644). Emits exactly what the onstop path
+   *  would — 'record-end' then 'record-pcm-data' from the chunks already pushed
+   *  (the same chunk set: the host stops capture before it flushes) — and stales
+   *  the pending onstop so nothing is emitted twice. The compressed MediaRecorder
+   *  blob is a closure inside startRecording and is never read by the host, so
+   *  'record-end' carries an empty Blob here. Returns false (and emits nothing)
+   *  when no PCM chunk was captured. */
+  public flushTake(): boolean {
+    if (this.recordedChunksPCM.length === 0) return false
+    // The pending onstop's emitWithBlob sees a stale generation and returns.
+    this.recordingGeneration++
+    // No-op if the host already stopped: state is 'inactive' synchronously
+    // after mediaRecorder.stop().
+    this.stopRecording()
+    this.emit('record-end', new Blob([], { type: this.mediaRecorder?.mimeType ?? '' }))
+    if (this.options.renderRecordedAudio) {
+      this.applyOriginalOptionsIfNeeded()
+      this.processPcmData()
+    }
+    return true
+  }
+
   /** Pause the recording */
   public pauseRecording() {
     if (this.isRecording()) {
