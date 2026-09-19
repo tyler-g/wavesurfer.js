@@ -83,6 +83,24 @@ export type ClipRenderFn = (
   window?: ClipContentWindow,
 ) => void
 
+/**
+ * Origin mark for a clip authored by ANOTHER collaborator (wavvy WVY-652):
+ * a hollow 11px disc with the author's initials placed BEFORE the clip name
+ * inside the label, a " · initials" tail the renderer's container query
+ * reveals at >= 160px clip width, and a "by <name>" hover sentence. Hosts
+ * pass null/undefined for their own and unstamped clips — nothing renders.
+ * Hollow = origin (past tense); the SOLID `.ws-clip-ghost-badge` remains
+ * the live-drag tense.
+ */
+export type ClipOriginMark = {
+  /** Peer identity color (border + tinted fill + initials). */
+  color: string
+  /** Initials ("T" / "TG"). */
+  label: string
+  /** Full display name → title "by <name>" + aria-label suffix. */
+  name: string
+}
+
 export type ClipParams = {
   id: string
   startTime: number // seconds
@@ -90,6 +108,8 @@ export type ClipParams = {
   originalDuration?: number // seconds — the original audio length (for looping/clipping)
   color?: string
   name?: string
+  /** Collaborator origin mark, or null/undefined for none. See ClipOriginMark. */
+  origin?: ClipOriginMark | null
   peaks?: number[] | null
   selected?: boolean
   /** Custom render function — replaces waveform rendering when provided */
@@ -141,6 +161,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public originalDuration: number
   public color: string
   public name: string
+  /** Current origin mark (null = none). DOM only — never part of paint state. */
+  public origin: ClipOriginMark | null = null
   public peaks: number[] | null
   public peaksPreLooped: boolean
   private originalPeaks: number[] | null
@@ -267,6 +289,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.originalDuration = params.originalDuration ?? this.duration
     this.color = params.color ?? 'rgba(56, 178, 172, 0.6)'
     this.name = params.name ?? ''
+    this.origin = params.origin ?? null
     this.peaks = params.peaks ?? null
     this.peaksPreLooped = false
     this.originalPeaks = this.peaks ? [...this.peaks] : null
@@ -296,7 +319,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       // or selected state. Attributes only — no behavior change. Keep these
       // in sync in setSelected() / setName().
       role: 'option',
-      'aria-label': this.name || 'Clip',
+      'aria-label': this.accessibleName(),
       'aria-selected': this.selected ? 'true' : 'false',
       // Roving tabindex: only the selected clip is a tab stop.
       tabindex: this.selected ? '0' : '-1',
@@ -317,8 +340,13 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       },
     })
 
-    // Name label
+    // Name label — a structured row (WVY-652): [origin disc] name [· initials].
+    // The disc sits BEFORE the name so the name's ellipsis can never remove
+    // it. `setName` writes `.ws-clip-name` only; `getLabelElement` returns
+    // this OUTER div (hosts overlay inline rename on it). Query by class,
+    // never `querySelector('div')` — the row now has span children.
     const label = createElement('div', {
+      class: 'ws-clip-label',
       style: {
         position: 'absolute',
         top: '1px',
@@ -329,6 +357,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         maxWidth: 'calc(100% - 8px)',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '3px',
         pointerEvents: 'auto',
         userSelect: 'none',
         zIndex: '3',
@@ -337,13 +368,19 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         lineHeight: '14px',
         cursor: 'default',
       },
+    })
+    const nameSpan = createElement('span', {
+      class: 'ws-clip-name',
+      style: { overflow: 'hidden', textOverflow: 'ellipsis', minWidth: '0' },
       textContent: this.name,
     })
+    label.appendChild(nameSpan)
     label.addEventListener('dblclick', (e) => {
       e.stopPropagation()
       this.emit('dblclick', e)
     })
     element.appendChild(label)
+    if (this.origin) this.applyOrigin(label, this.origin)
 
     // Dblclick anywhere on the clip body emits the same event. The label's
     // listener stopPropagation()s so this only fires for dblclicks NOT on the
@@ -2003,17 +2040,97 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public setName(name: string) {
     this.name = name
     if (this.element) {
-      const label = this.element.querySelector('div') as HTMLElement
-      if (label) label.textContent = name
+      // Write the NAME SPAN only — `label.textContent = name` would delete
+      // the origin disc (WVY-652).
+      const nameSpan = this.element.querySelector('.ws-clip-name') as HTMLElement | null
+      if (nameSpan) nameSpan.textContent = name
       // The visible label is inside the clip, but the clip itself carries the
       // accessible name (WVY-386) — rename must move both.
-      this.element.setAttribute('aria-label', name || 'Clip')
+      this.element.setAttribute('aria-label', this.accessibleName())
     }
   }
 
   public getLabelElement(): HTMLElement | null {
     if (!this.element) return null
-    return this.element.querySelector('div') as HTMLElement | null
+    return this.element.querySelector('.ws-clip-label') as HTMLElement | null
+  }
+
+  /** Accessible name: the clip name, suffixed " (by <name>)" when an origin
+   *  mark is set (WVY-652). */
+  private accessibleName(): string {
+    const base = this.name || 'Clip'
+    return this.origin ? `${base} (by ${this.origin.name})` : base
+  }
+
+  /**
+   * Set or clear the collaborator origin mark (WVY-652). Idempotent: an
+   * existing disc is updated in place; null removes the disc and the
+   * " · initials" tail and restores the plain accessible name. DOM only —
+   * no event, no paint-state invalidation.
+   */
+  public setOrigin(origin: ClipOriginMark | null) {
+    this.origin = origin ?? null
+    if (!this.element) return
+    const label = this.getLabelElement()
+    if (label) {
+      if (this.origin) this.applyOrigin(label, this.origin)
+      else {
+        label.querySelector('.ws-clip-origin')?.remove()
+        label.querySelector('.ws-clip-origin-text')?.remove()
+      }
+    }
+    this.element.setAttribute('aria-label', this.accessibleName())
+  }
+
+  /** Create-or-update the origin disc (before the name) and the hidden
+   *  " · initials" tail (after it) inside the label row. */
+  private applyOrigin(label: HTMLElement, origin: ClipOriginMark) {
+    const hover = `by ${origin.name}`
+    let disc = label.querySelector<HTMLElement>('.ws-clip-origin')
+    if (!disc) {
+      // Hollow disc — visually identical to wavvy's `PeerDisc` size 11:
+      // tinted fill (color + 20% alpha), 1px color border, colored initials.
+      disc = createElement('span', {
+        class: 'ws-clip-origin',
+        role: 'img',
+        'data-help-title': 'Clip origin',
+        'data-help-desc': 'Added by a collaborator. Informational only — anyone can still edit it.',
+        style: {
+          width: '11px',
+          height: '11px',
+          borderRadius: '50%',
+          boxSizing: 'border-box',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flex: 'none',
+          fontSize: '7px',
+          fontWeight: '700',
+          lineHeight: '1',
+          textShadow: 'none',
+        },
+      }) as HTMLElement
+      label.insertBefore(disc, label.firstChild)
+    }
+    disc.style.border = `1px solid ${origin.color}`
+    disc.style.background = `${origin.color}33`
+    disc.style.color = origin.color
+    disc.setAttribute('title', hover)
+    disc.setAttribute('aria-label', hover)
+    if (disc.textContent !== origin.label) disc.textContent = origin.label
+
+    let tail = label.querySelector<HTMLElement>('.ws-clip-origin-text')
+    if (!tail) {
+      tail = createElement('span', {
+        class: 'ws-clip-origin-text',
+        // Hidden by default; the renderer's `@container (min-width: 160px)`
+        // rule reveals it on wide clips (`renderer.ts` shadow <style>).
+        style: { display: 'none', opacity: '0.8', flex: 'none' },
+      }) as HTMLElement
+      label.appendChild(tail)
+    }
+    const text = ` · ${origin.label}`
+    if (tail.textContent !== text) tail.textContent = text
   }
 
   public setPeaks(peaks: number[] | null, preLooped = false) {

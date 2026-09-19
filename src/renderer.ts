@@ -244,6 +244,17 @@ class Renderer extends EventEmitter<RendererEvents> {
         }
         .ws-clip {
           cursor: grab;
+          /* Origin-mark width rule (wavvy WVY-652): clip width is only ever
+             a percentage, so the " · initials" tail is gated by a container
+             query rather than a resize poll. Inline-size containment on an
+             absolutely positioned, explicitly sized, overflow-hidden box
+             changes no layout. */
+          container-type: inline-size;
+        }
+        @container (min-width: 160px) {
+          .ws-clip-origin-text {
+            display: inline !important;
+          }
         }
         .ws-clip--dragging {
           cursor: grabbing;
