@@ -197,6 +197,18 @@ export function computeContentWindow(
 }
 
 /**
+ * Apply a draw-time gain multiplier to a normalized sample/peak magnitude and
+ * clip it at the box (±1) — Ableton clip-view behavior: a boosted waveform
+ * flattens against the top and bottom of the clip instead of overflowing it.
+ * Draw-time ONLY: peaks/PCM arrays are never modified (they feed the host's
+ * merge fingerprints and saved state).
+ */
+export function applyGainClip(v: number, gainScale: number): number {
+  const s = v * gainScale
+  return s > 1 ? 1 : s < -1 ? -1 : s
+}
+
+/**
  * Positive-modulo wrap of a (phase-shifted) clip time into a loop tile:
  * returns tileT in [0, loopLen). Guards the floating-point edge where
  * `shifted` sits within one ulp BELOW zero (or below a tile multiple) and

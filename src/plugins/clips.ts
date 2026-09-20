@@ -9,6 +9,7 @@ import { makeDraggable } from '../draggable.js'
 import EventEmitter from '../event-emitter.js'
 import createElement from '../dom.js'
 import {
+  applyGainClip,
   computeClipSampleWindow,
   computeContentPixelWidth,
   computeContentWindow,
@@ -18,6 +19,11 @@ import {
 } from '../clip-render-math.js'
 import type { ClipContentWindow } from '../clip-render-math.js'
 export type { ClipContentWindow }
+
+/** A NaN / zero / negative gain would blank the waveform — fall back to unity. */
+function sanitizeGainScale(v: number | undefined): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 1
+}
 
 export type ClipsPluginOptions =
   | {
@@ -150,6 +156,10 @@ export type ClipParams = {
    *  starting the tile at `loopStartSec`. Defaults to 0, which reduces
    *  every phase-aware expression to today's phase-less behavior. */
   loopPhaseSec?: number
+  /** Linear amplitude multiplier applied at DRAW TIME only (default 1).
+   *  The host passes 10^(clipGainDb/20); peaks/PCM are never modified and
+   *  the drawn envelope is clipped at ±1 (Ableton clip-view behavior). */
+  gainScale?: number
 }
 
 class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
@@ -185,6 +195,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public loopStartSec: number = 0
   public loopEndSec: number = 0
   public loopPhaseSec: number = 0
+  /** Draw-time amplitude multiplier — see `ClipParams.gainScale`. Only
+   *  `setGainScale` writes it; always finite and > 0. */
+  public gainScale: number = 1
   /** Cumulative left-edge movement (seconds; positive = extended left) of
    *  the CURRENT resize drag. Read by paintPhaseSec (and by custom content
    *  renderers via the block reference) to keep painted content anchored to
@@ -254,6 +267,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     loopStartSec: number
     loopEndSec: number
     loopPhaseSec: number
+    // Draw-time gain (WVY-660) — a render input, so it must join the key or
+    // a setGainScale would repaint nothing.
+    gainScale: number
     // Drag-transient inputs of a windowed custom-content paint (WVY-87):
     // an in-drag frame must never reuse a window painted under a
     // different edge offset, and the release repaint must not be skipped.
@@ -303,6 +319,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.loopStartSec = params.loopStartSec ?? 0
     this.loopEndSec = params.loopEndSec ?? 0
     this.loopPhaseSec = params.loopPhaseSec ?? 0
+    this.gainScale = sanitizeGainScale(params.gainScale)
     this.totalDuration = Math.max(totalDuration, 0.001)
     this.element = this.initElement()
     this.renderPosition()
@@ -1086,6 +1103,9 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const n = peaks.length
     if (n === 0) return
     ctx.fillStyle = color
+    // Draw-time gain (WVY-660): magnitudes are scaled and clipped at the box;
+    // the peaks array itself is never touched.
+    const g = this.gainScale
     ctx.beginPath()
     // Top half of the envelope — trace peaks upward from yCenter.
     ctx.moveTo(0, yCenter)
@@ -1093,7 +1113,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     for (let i = 0; i < n; i++) {
       const mag = peaks[i]
       const absMag = mag < 0 ? -mag : mag
-      const h = absMag * yHalfHeight
+      const h = applyGainClip(absMag, g) * yHalfHeight
       ctx.lineTo(i * scale, yCenter - h)
     }
     ctx.lineTo(pixelW, yCenter)
@@ -1101,7 +1121,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     for (let i = n - 1; i >= 0; i--) {
       const mag = peaks[i]
       const absMag = mag < 0 ? -mag : mag
-      const h = absMag * yHalfHeight
+      const h = applyGainClip(absMag, g) * yHalfHeight
       ctx.lineTo(i * scale, yCenter + h)
     }
     ctx.closePath()
@@ -1132,9 +1152,12 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     ctx.lineJoin = 'round'
     ctx.beginPath()
 
+    // Draw-time gain (WVY-660), clipped signed at the box so the dots below
+    // sit on the flattened line.
+    const g = this.gainScale
     const xScale = pixelW / (span - 1)
     for (let i = 0; i < span; i++) {
-      const s = channel[start + i]
+      const s = applyGainClip(channel[start + i], g)
       const x = i * xScale
       const y = yCenter - s * yHalfHeight
       if (i === 0) ctx.moveTo(x, y)
@@ -1148,7 +1171,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       ctx.fillStyle = 'rgba(255,255,255,0.9)'
       const dotR = Math.max(1.5, Math.min(3, pxPerSample * 0.18))
       for (let i = 0; i < span; i++) {
-        const s = channel[start + i]
+        const s = applyGainClip(channel[start + i], g)
         const x = i * xScale
         const y = yCenter - s * yHalfHeight
         ctx.beginPath()
@@ -1305,6 +1328,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     ctx.lineJoin = 'round'
     ctx.beginPath()
 
+    // Draw-time gain (WVY-660), clipped signed at the box.
+    const g = this.gainScale
     let prevSrcSample = -1
     let inSubpath = false
     for (let x = 0; x < pixelW; x++) {
@@ -1321,7 +1346,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         inSubpath = false
         continue
       }
-      const s = channel[srcSample]
+      const s = applyGainClip(channel[srcSample], g)
       const y = yCenter - s * yHalfHeight
       // Detect loop wrap (srcSample jumped backward by more than a couple
       // samples). Start a new subpath so the polyline doesn't draw a
@@ -1351,7 +1376,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         const tileT = wrapTileTime(shifted, loopLen)
         const srcSample = loopStartSample + Math.floor(tileT * sr)
         if (srcSample < 0 || srcSample >= channel.length) continue
-        const s = channel[srcSample]
+        const s = applyGainClip(channel[srcSample], g)
         const y = yCenter - s * yHalfHeight
         ctx.beginPath()
         ctx.arc(x, y, dotR, 0, Math.PI * 2)
@@ -1714,6 +1739,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         this.lastPaintState.loopStartSec === this.loopStartSec &&
         this.lastPaintState.loopEndSec === this.loopEndSec &&
         this.lastPaintState.loopPhaseSec === this.loopPhaseSec &&
+        this.lastPaintState.gainScale === this.gainScale &&
         this.canvas.width === pixelW &&
         this.canvas.height === pixelH
       ) {
@@ -1747,6 +1773,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           loopStartSec: this.loopStartSec,
           loopEndSec: this.loopEndSec,
           loopPhaseSec: this.loopPhaseSec,
+          gainScale: this.gainScale,
           resizeStartDeltaSec: this.resizeStartDeltaSec,
           paintLeadInSec: this.paintLeadInSec,
         }
@@ -2192,6 +2219,20 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.loopStartSec = startSec
     this.loopEndSec = endSec
     this.loopPhaseSec = phaseSec
+    this.lastPaintState = null
+    this.renderWaveform()
+  }
+
+  /**
+   * Set the DRAW-TIME amplitude multiplier (wavvy WVY-660). The host passes
+   * `10^(clipGainDb/20)`; the waveform is scaled and clipped at ±1 while the
+   * peaks/PCM arrays stay untouched. A repeat value is a no-op — AudioTrack's
+   * sync effect calls every setter on every fingerprint change.
+   */
+  public setGainScale(gainScale: number) {
+    const next = sanitizeGainScale(gainScale)
+    if (next === this.gainScale) return
+    this.gainScale = next
     this.lastPaintState = null
     this.renderWaveform()
   }

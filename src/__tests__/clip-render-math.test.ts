@@ -1,4 +1,5 @@
 import {
+  applyGainClip,
   computeClipSampleWindow,
   computeContentPixelWidth,
   computeContentWindow,
@@ -430,5 +431,27 @@ describe('computeContentWindow', () => {
       dpr,
     })
     expect(win.bitmapW).toBe(1)
+  })
+})
+
+describe('applyGainClip (wavvy WVY-660)', () => {
+  test('clips at the top of the box instead of overflowing it', () => {
+    expect(applyGainClip(0.8, 2)).toBe(1)
+  })
+
+  test('clips at the bottom of the box', () => {
+    expect(applyGainClip(-0.8, 2)).toBe(-1)
+  })
+
+  test('identity at unity gain', () => {
+    expect(applyGainClip(0.5, 1)).toBe(0.5)
+  })
+
+  test('cut scales down linearly', () => {
+    expect(applyGainClip(0.5, 0.5)).toBe(0.25)
+  })
+
+  test('zero stays zero at any gain', () => {
+    expect(applyGainClip(0, 4)).toBe(0)
   })
 })
