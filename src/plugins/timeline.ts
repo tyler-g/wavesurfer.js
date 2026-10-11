@@ -95,7 +95,7 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
   private gridMode: 'beats' | 'seconds' = 'beats'
   private tempo: number = 120
   private gridSubdivision: string = '1/4'
-  /** Layout snapshot recomputed once per redraw (the ONLY layout read). */
+  /** Layout snapshot recomputed once per redraw (the ONLY layout read — wrapper.offsetWidth). */
   private gridLayout: { duration: number; pxPerSec: number } | null = null
   /** Painted window in timeline CSS px — [from, to) currently on the canvas. */
   private paintedFrom = 0
@@ -397,7 +397,14 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
     this.unsubscribeNotches = []
 
     const duration = this.wavesurfer?.getEffectiveDuration() ?? this.options.duration ?? 0
-    const pxPerSec = (this.wavesurfer?.getWrapper().scrollWidth || this.timelineWrapper.scrollWidth) / duration
+    // LAID-OUT width, never scrollWidth: the wrapper does not clip, so this
+    // plugin's own previously painted grid canvas (it overhangs by
+    // GRID_PAINT_MARGIN) and any other overlay inflate scrollWidth. That
+    // self-sustains a stale px/s after a zoom-out and stretches the grid at fit
+    // zoom. offsetWidth is the box the percent cursor resolves against and the
+    // width wavvy's ruler divides (wrapperLaidOutWidth) — WVY-1162.
+    const laidOutWidth = this.wavesurfer?.getWrapper().offsetWidth || this.timelineWrapper.offsetWidth
+    const pxPerSec = laidOutWidth / duration
 
     // Grid: cache the layout snapshot and repaint the visible window.
     this.gridLayout = duration > 0 && isFinite(pxPerSec) ? { duration, pxPerSec } : null
