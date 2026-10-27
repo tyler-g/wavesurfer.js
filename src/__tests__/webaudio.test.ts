@@ -133,3 +133,75 @@ describe('WebAudioPlayer projectDuration lift', () => {
     expect(player.currentTime).toBeCloseTo(0)
   })
 })
+
+/**
+ * wavvy WVY-1506: a scheduled start (`playAt(when)` with `when` in the future)
+ * reads as its start position until the audio clock reaches `when`. Before
+ * this, `currentTime` ran from `start − remaining lead` up to the start, so
+ * every host track cursor was drawn BEFORE the play point through the
+ * transport start lead while the host ruler held on it (cardinal rule 10).
+ */
+describe('scheduled start holds the position (wavvy WVY-1506)', () => {
+  test('currentTime holds the start position until the scheduled when', () => {
+    const { player, ctx } = createPlayer(60)
+    player.currentTime = 8
+    const t0 = ctx.currentTime
+    player.playAt(t0 + 0.09)
+
+    expect(player.currentTime).toBe(8)
+    ctx.advance(0.05)
+    expect(player.currentTime).toBe(8)
+    ctx.advance(0.0399)
+    expect(player.currentTime).toBe(8)
+    ctx.advance(0.0101) // t0 + 0.1
+    expect(player.currentTime).toBeCloseTo(8.01, 9)
+  })
+
+  test('pauseAt inside the lead never moves the position backwards', () => {
+    const { player, ctx } = createPlayer(60)
+    player.currentTime = 8
+    player.playAt(ctx.currentTime + 0.09)
+    ctx.advance(0.03)
+    player.pauseAt(ctx.currentTime)
+    expect(player.currentTime).toBe(8)
+  })
+
+  test('pauseAt after the scheduled when is unchanged', () => {
+    const { player, ctx } = createPlayer(60)
+    player.currentTime = 8
+    player.playAt(ctx.currentTime + 0.09)
+    ctx.advance(0.09 + 1)
+    player.pauseAt(ctx.currentTime)
+    expect(player.currentTime).toBeCloseTo(9, 9)
+  })
+
+  test('pause() inside the lead never moves the position backwards', () => {
+    const { player, ctx } = createPlayer(60)
+    player.currentTime = 8
+    player.playAt(ctx.currentTime + 0.09)
+    ctx.advance(0.03)
+    player.pause()
+    expect(player.currentTime).toBe(8)
+  })
+
+  test('loop region: holds through the lead, then wraps exactly as before', () => {
+    const { player, ctx } = createPlayer(60)
+    player.setLoopRegion(1, 3)
+    player.currentTime = 2.5
+    player.playAt(ctx.currentTime + 0.09)
+
+    expect(player.currentTime).toBe(2.5)
+    ctx.advance(0.05)
+    expect(player.currentTime).toBe(2.5)
+    ctx.advance(0.04 + 0.7)
+    expect(player.currentTime).toBeCloseTo(1.2, 9)
+  })
+
+  test('a late start (when in the past) still reads ahead immediately', () => {
+    const { player, ctx } = createPlayer(60)
+    ctx.advance(10)
+    player.currentTime = 8
+    player.playAt(ctx.currentTime - 0.5)
+    expect(player.currentTime).toBeCloseTo(8.5, 9)
+  })
+})

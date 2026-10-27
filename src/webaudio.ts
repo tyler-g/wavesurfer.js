@@ -125,10 +125,19 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     }
   }
 
+  /** Elapsed play time at ctx time `at`, never negative (wavvy WVY-1506):
+   *  a scheduled start (`playAt(when)` with `when` in the future) reads as its
+   *  start position until the audio clock reaches `when`, so a host's track
+   *  cursor holds ON the play point through its start lead instead of running
+   *  up to it. Audio is untouched — `bufferNode.start(when, …)` decides that. */
+  private elapsedSince(at: number): number {
+    return Math.max(0, at - this.playStartTime)
+  }
+
   private _pause() {
     this.paused = true
     this.bufferNode?.stop()
-    this.playedDuration += this.audioContext.currentTime - this.playStartTime
+    this.playedDuration += this.elapsedSince(this.audioContext.currentTime)
   }
 
   async play() {
@@ -186,7 +195,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     if (this.paused) return
     this.paused = true
     this.bufferNode?.stop()
-    this.playedDuration += when - this.playStartTime
+    this.playedDuration += this.elapsedSince(when)
     this.emit('pause')
   }
 
@@ -246,7 +255,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
   get currentTime() {
     const rawTime = this.paused
       ? this.playedDuration
-      : this.playedDuration + (this.audioContext.currentTime - this.playStartTime)
+      : this.playedDuration + this.elapsedSince(this.audioContext.currentTime)
     const time = rawTime * this._playbackRate
     // When native loop is engaged, the audio thread wraps but our
     // playStartTime/playedDuration don't — wrap the apparent time to match
