@@ -107,6 +107,16 @@ export type ClipOriginMark = {
   name: string
 }
 
+/** A collaborator editing this clip RIGHT NOW (wavvy WVY-1666): live tense,
+ *  so a SOLID dot — the hollow `.ws-clip-origin` disc is the past-tense
+ *  "added by". The host validates `color` before passing it. */
+export type ClipEditingPeer = {
+  /** Peer identity color (dot fill). */
+  color: string
+  /** Display name → title / aria-label "<name> editing". */
+  name: string
+}
+
 export type ClipParams = {
   id: string
   startTime: number // seconds
@@ -173,6 +183,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public name: string
   /** Current origin mark (null = none). DOM only — never part of paint state. */
   public origin: ClipOriginMark | null = null
+  /** Live editing marks (WVY-1666). DOM only — never part of paint state. */
+  public editingPeers: ClipEditingPeer[] = []
   public peaks: number[] | null
   public peaksPreLooped: boolean
   private originalPeaks: number[] | null
@@ -2107,6 +2119,61 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       }
     }
     this.element.setAttribute('aria-label', this.accessibleName())
+  }
+
+  /**
+   * Set or clear the live "editing now" mark (wavvy WVY-1666): one solid dot
+   * per remote peer, in the label row between the origin disc and the name
+   * so the name's ellipsis never eats it. Idempotent; [] / null removes it.
+   * DOM only — no event, no paint-state invalidation.
+   */
+  public setEditingPeers(peers: ClipEditingPeer[] | null) {
+    const next = peers ?? []
+    const same =
+      next.length === this.editingPeers.length &&
+      next.every((p, i) => p.color === this.editingPeers[i].color && p.name === this.editingPeers[i].name)
+    if (same) return
+    this.editingPeers = next.map((p) => ({ color: p.color, name: p.name }))
+    const label = this.getLabelElement()
+    if (label) this.applyEditingPeers(label)
+  }
+
+  private applyEditingPeers(label: HTMLElement) {
+    let mark = label.querySelector<HTMLElement>('.ws-clip-editing')
+    if (this.editingPeers.length === 0) {
+      mark?.remove()
+      return
+    }
+    if (!mark) {
+      mark = createElement('span', {
+        class: 'ws-clip-editing',
+        role: 'img',
+        'data-help-title': 'Collaborator editing',
+        'data-help-desc': 'A collaborator is renaming this clip or editing its notes right now. Informational only — it never blocks your edits.',
+        style: { display: 'inline-flex', alignItems: 'center', gap: '2px', flex: 'none' },
+      }) as HTMLElement
+      label.insertBefore(mark, label.querySelector('.ws-clip-name'))
+    }
+    const hover = `${this.editingPeers.map((p) => p.name).join(', ')} editing`
+    mark.setAttribute('title', hover)
+    mark.setAttribute('aria-label', hover)
+    mark.replaceChildren(
+      ...this.editingPeers.map(
+        (p) =>
+          createElement('span', {
+            class: 'ws-clip-editing-dot',
+            style: {
+              width: '7px',
+              height: '7px',
+              borderRadius: '50%',
+              boxSizing: 'border-box',
+              flex: 'none',
+              background: p.color,
+              border: '1px solid rgba(0,0,0,0.6)',
+            },
+          }) as HTMLElement,
+      ),
+    )
   }
 
   /** Create-or-update the origin disc (before the name) and the hidden
