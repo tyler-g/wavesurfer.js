@@ -84,9 +84,21 @@ describe('ClipsPlugin gainScale (WVY-660)', () => {
     expect(peaks).toEqual([0.5, 0.25])
   })
 
-  it.each([[NaN], [0], [-2], [Infinity]])('sanitizes gainScale %p to 1', (bad) => {
+  it.each([[NaN], [-2], [Infinity]])('sanitizes gainScale %p to 1', (bad) => {
     const clip = makeClip({ gainScale: bad }) as any
     expect(clip.gainScale).toBe(1)
+  })
+
+  // wavvy WVY-1631: clip gain −∞ is gainScale exactly 0 — a flat waveform,
+  // never the unity fallback (EAR-045: −∞ drew FULL size in the arrangement).
+  it('gainScale 0 is kept and draws a flat envelope', () => {
+    const clip = makeClip({ gainScale: 0 }) as any
+    expect(clip.gainScale).toBe(0)
+    const offsets = peakOffsets(clip, recordingCtx(), [0.5, 0.9], 50, 50)
+    for (const off of offsets) expect(off).toBe(0)
+    clip.setGainScale(1)
+    clip.setGainScale(0)
+    expect(clip.gainScale).toBe(0)
   })
 
   it('sample-line primitive clips the signed sample at both rails', () => {

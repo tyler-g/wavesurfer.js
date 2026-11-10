@@ -20,9 +20,10 @@ import {
 import type { ClipContentWindow } from '../clip-render-math.js'
 export type { ClipContentWindow }
 
-/** A NaN / zero / negative gain would blank the waveform — fall back to unity. */
+/** A NaN / negative / infinite gain falls back to unity. Exactly 0 is VALID:
+ *  the host's −∞ clip-gain stop (wavvy WVY-1631) draws a flat waveform. */
 function sanitizeGainScale(v: number | undefined): number {
-  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 1
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 1
 }
 
 export type ClipsPluginOptions =
