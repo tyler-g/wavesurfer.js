@@ -44,7 +44,7 @@ export type TimelinePluginOptions = {
   secondaryLabelOpacity?: number
   /** Show vertical grid lines extending through the track waveform area, defaults to false */
   gridLines?: boolean
-  /** Color of the grid lines, defaults to 'rgba(255, 255, 255, 0.05)' */
+  /** Color of the grid lines, defaults to 'rgba(255, 255, 255, 0.12)'. Changeable later via `setGridLinesColor`. */
   gridLinesColor?: string
   /** Grid line placement mode: 'beats' places at beat positions based on tempo, 'seconds' places at every time notch. Defaults to 'beats'. */
   gridMode?: 'beats' | 'seconds'
@@ -209,6 +209,22 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
   public setGridSubdivision(value: string) {
     this.gridSubdivision = value
     this.initTimeline()
+  }
+
+  /**
+   * Change the grid-line colour after creation and repaint the visible grid
+   * (wavvy WVY-1777, light mode). `undefined` / `null` / an empty string
+   * restores the built-in default `'rgba(255, 255, 255, 0.12)'`. Bar / beat /
+   * sub-beat lines keep their relative alpha (1 / 0.4 / 0.18) on top of this
+   * colour. A repeat value is a no-op.
+   */
+  public setGridLinesColor(color: string | null | undefined) {
+    const next = typeof color === 'string' && color.trim() ? color : undefined
+    if (this.options.gridLinesColor === next) return
+    this.options.gridLinesColor = next
+    if (!this.wavesurfer) return
+    const scrollLeft = this.wavesurfer.getScroll()
+    this.paintGrid(scrollLeft, scrollLeft + this.wavesurfer.getWidth())
   }
 
   /** Unmount */

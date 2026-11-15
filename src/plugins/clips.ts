@@ -18,6 +18,8 @@ import {
   wrapTileTime,
 } from '../clip-render-math.js'
 import type { ClipContentWindow } from '../clip-render-math.js'
+import { CLIP_DOM_STYLE, DEFAULT_CLIP_CANVAS_COLORS, resolveClipCanvasColors } from '../clip-theme.js'
+import type { ClipCanvasColors } from '../clip-theme.js'
 export type { ClipContentWindow }
 
 /** A NaN / negative / infinite gain falls back to unity. Exactly 0 is VALID:
@@ -362,7 +364,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         // Use outline (not border) so the frame has zero layout impact — no
         // content-box inset, so the clip's waveform centerline stays on the
         // track centerline, and toggling selection doesn't shift anything.
-        outline: this.selected ? '2px solid #fff' : '2px solid rgba(255,255,255,0.18)',
+        // Theme variables (WVY-1777) — fallbacks are the pre-theme literals.
+        outline: this.selected ? CLIP_DOM_STYLE.selectedOutline : CLIP_DOM_STYLE.outline,
         outlineOffset: '-2px',
         pointerEvents: 'all',
         overflow: 'hidden',
@@ -382,7 +385,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         top: '1px',
         left: '4px',
         fontSize: '10px',
-        color: '#fff',
+        color: CLIP_DOM_STYLE.labelColor,
         whiteSpace: 'nowrap',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
@@ -393,7 +396,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
         pointerEvents: 'auto',
         userSelect: 'none',
         zIndex: '3',
-        textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+        textShadow: CLIP_DOM_STYLE.labelShadow,
         fontFamily: 'system-ui, sans-serif',
         lineHeight: '14px',
         cursor: 'default',
@@ -450,7 +453,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       style: {
         ...handleStyle,
         left: '0',
-        borderLeft: '2px solid rgba(255,255,255,0.5)',
+        borderLeft: CLIP_DOM_STYLE.handleBorder,
         borderRadius: '3px 0 0 3px',
       } as any,
     })
@@ -459,7 +462,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       style: {
         ...handleStyle,
         right: '0',
-        borderRight: '2px solid rgba(255,255,255,0.5)',
+        borderRight: CLIP_DOM_STYLE.handleBorder,
         borderRadius: '0 3px 3px 0',
       } as any,
     })
@@ -1160,7 +1163,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const span = end - start
     if (span <= 1) return
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+    const colors = this.canvasColors()
+    ctx.strokeStyle = colors.sampleLine
     ctx.lineWidth = Math.max(1, Math.round(pixelW / span) * 0.5)
     ctx.lineJoin = 'round'
     ctx.beginPath()
@@ -1181,7 +1185,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // Dots at individual sample positions at extreme zoom.
     const pxPerSample = pixelW / span
     if (pxPerSample >= 8) {
-      ctx.fillStyle = 'rgba(255,255,255,0.9)'
+      ctx.fillStyle = colors.sampleDot
       const dotR = Math.max(1.5, Math.min(3, pxPerSample * 0.18))
       for (let i = 0; i < span; i++) {
         const s = applyGainClip(channel[start + i], g)
@@ -1216,7 +1220,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
       return true
     }
 
-    const waveColor = 'rgba(255,255,255,0.4)'
+    const waveColor = this.canvasColors().wave
     if (this.pcm.length >= 2 && this.pcm[1]) {
       const peaksL = computePeaksCh(0)
       const peaksR = computePeaksCh(1)
@@ -1336,7 +1340,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const cssPerPixel = canvasWidthCss / Math.max(1, pixelW)
     const secPerCssPx = this.secPerCssPx(clipWidthCss)
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+    const colors = this.canvasColors()
+    ctx.strokeStyle = colors.sampleLine
     ctx.lineWidth = 1
     ctx.lineJoin = 'round'
     ctx.beginPath()
@@ -1380,7 +1385,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     const samplesPerPixel = secPerCssPx * cssPerPixel * sr
     const pxPerSample = samplesPerPixel > 0 ? 1 / samplesPerPixel : 0
     if (pxPerSample >= 8) {
-      ctx.fillStyle = 'rgba(255,255,255,0.9)'
+      ctx.fillStyle = colors.sampleDot
       const dotR = Math.max(1.5, Math.min(3, pxPerSample * 0.18))
       for (let x = 0; x < pixelW; x++) {
         const cssPx = canvasLeftCss + (x + 0.5) * cssPerPixel
@@ -2003,7 +2008,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           pixelW,
           pixelH / 2,
           pixelH / 2,
-          'rgba(255,255,255,0.4)',
+          this.canvasColors().wave,
         )
         const fbLoopLen = this.loopEndSec - this.loopStartSec
         if (this.loopEnabled && fbLoopLen > 0.0001) {
@@ -2062,8 +2067,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.selected = selected
     if (this.element) {
       this.element.style.outline = selected
-        ? '2px solid #fff'
-        : '2px solid rgba(255,255,255,0.18)'
+        ? CLIP_DOM_STYLE.selectedOutline
+        : CLIP_DOM_STYLE.outline
       // Keep the ARIA/roving-tabindex state on the option in sync (WVY-386).
       this.element.setAttribute('aria-selected', selected ? 'true' : 'false')
       this.element.setAttribute('tabindex', selected ? '0' : '-1')
@@ -2228,6 +2233,26 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     if (tail.textContent !== text) tail.textContent = text
   }
 
+  /** Canvas colours for this paint: the owner plugin's cached theme
+   *  resolution (WVY-1777), or the pre-theme literals when detached. */
+  private canvasColors(): ClipCanvasColors {
+    return this.ownerPlugin?.getCanvasColors() ?? DEFAULT_CLIP_CANVAS_COLORS
+  }
+
+  /**
+   * Force the next paint to run even though no paint input changed (theme
+   * switch, WVY-1777). Drops the paint-state snapshot exactly like the data
+   * setters do; data, position, selection and drag state are untouched.
+   * Off-screen clips stay culled and repaint when they scroll into view
+   * (the null snapshot defeats their short-circuit then). Hosts call the
+   * plugin-level `ClipsPlugin.invalidatePaint()`, which also drops the
+   * cached colour lookup.
+   */
+  public invalidatePaint() {
+    this.lastPaintState = null
+    this.renderWaveform()
+  }
+
   public setPeaks(peaks: number[] | null, preLooped = false) {
     this.peaks = peaks
     this.peaksPreLooped = preLooped
@@ -2377,6 +2402,11 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
   // canvas positions instead of canvases that grow with zoom level.
   private wrapperEl: HTMLElement | null = null
   private scrollEl: HTMLElement | null = null
+  /** Resolved `--ws-clip-*` canvas colours (WVY-1777). Resolved lazily on
+   *  the first paint with the overlay in a document, then reused by every
+   *  clip until `invalidatePaint()` drops it — one getComputedStyle per
+   *  theme, never per clip or per frame. */
+  private canvasColorCache: ClipCanvasColors | null = null
 
   constructor(options?: ClipsPluginOptions) {
     super(options as ClipsPluginOptions)
@@ -2421,6 +2451,7 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
     })
     wrapper.appendChild(this.container)
     wrapper.style.position = 'relative'
+    this.canvasColorCache = null
 
     // Track duration changes
     this.totalDuration = this.wavesurfer.getDuration() || 1
@@ -2543,6 +2574,43 @@ class ClipsPlugin extends BasePlugin<ClipsPluginEvents, ClipsPluginOptions> {
    */
   public setSnapConfig(gridSeconds: number, enabled: boolean) {
     this.snapConfig = { gridSeconds: Math.max(0, gridSeconds), enabled }
+  }
+
+  /**
+   * Canvas colours for clip paints (WVY-1777): the `--ws-clip-wave-color` /
+   * `--ws-clip-sample-color` custom properties as inherited by the clips
+   * overlay (a child of the shadow-DOM wrapper, so it inherits from the
+   * wavesurfer container and its ancestors), each falling back to its
+   * pre-theme literal. Cached until `invalidatePaint()`. While the overlay
+   * is not in a document the literals are returned UNCACHED. Never throws,
+   * never returns an empty colour. Called by clips during paint.
+   */
+  public getCanvasColors(): ClipCanvasColors {
+    if (this.canvasColorCache) return this.canvasColorCache
+    const resolved = resolveClipCanvasColors(this.container)
+    if (!resolved) return DEFAULT_CLIP_CANVAS_COLORS
+    this.canvasColorCache = resolved
+    return resolved
+  }
+
+  /**
+   * Repaint every clip canvas with the CURRENT theme colours (wavvy
+   * WVY-1777). Call after any change to the `--ws-clip-*` custom properties
+   * (a colour-scheme switch — including the first scheme application if it
+   * can land after clips have painted) and after any change to colours a
+   * custom `renderContent` reads, since a clip canvas otherwise skips its
+   * repaint while its data is unchanged. DOM colours (outline, label,
+   * handles) are CSS `var()`s and update without this call.
+   *
+   * Drops the cached colour lookup and each clip's paint-state snapshot,
+   * then schedules the usual rAF-coalesced repaint: visible clips repaint on
+   * the next frame, culled off-screen clips when they scroll into view. Clip
+   * data, position, layout, scroll and selection are untouched. Cost is one
+   * zoom-step repaint of the visible clips.
+   */
+  public invalidatePaint() {
+    this.canvasColorCache = null
+    for (const clip of this.clips) clip.invalidatePaint()
   }
 
   private updateAllClipPositions() {

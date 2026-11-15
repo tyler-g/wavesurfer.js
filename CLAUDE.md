@@ -78,6 +78,10 @@ The clip label is a structured `div.ws-clip-label` row — optional hollow `span
 
 `addClip({ renderContent, contentWindowed: true })` routes a custom renderer through the same viewport-sized, timeline-device-pixel-grid-quantized canvas window as the PCM path and calls it with a 5th arg, `ClipContentWindow { startSec, endSec, pxPerSecDevice, bitmapW }` (`src/clip-render-math.ts`, `computeContentWindow`). 5-arg contract: map `x = (t − startSec) × pxPerSecDevice`, ignore `contentW`, and treat a NEGATIVE `startSec` as the left-edge-drag lead-in — real content (earlier loop tiles / earlier trim source) must be painted there, because `repaintForResizeDrag` slides the canvas into it (slide origin `paintCanvasLeftCss`). Windowed clips get a paint short-circuit keyed on window geometry + loop/drag inputs; `setData`/`setRenderContent` invalidate it. Flag off (default) = the legacy full-clip 4-arg path, unchanged. Wavvy consumer + details: `src/utils/midi-note-preview.ts`, `docs/architecture/clip-rendering.md` "Render path dispatch" §3.
 
+## ClipsPlugin theme colours (wavvy WVY-1777)
+
+Every dark-assumed clip colour is a `--ws-clip-*` custom property whose fallback is EXACTLY the old literal (`src/clip-theme.ts`) — a host that sets nothing renders as before. DOM colours (outline, selected outline, label colour + shadow, resize-handle border) are inline `var()`s; canvas colours (`--ws-clip-wave-color`, `--ws-clip-sample-color`) are resolved from the clips overlay's computed style, cached per plugin, and dropped only by `ClipsPlugin.invalidatePaint()`, which also nulls every clip's `lastPaintState` so the short-circuit can't keep stale colours. The host calls `invalidatePaint()` after a scheme change. Timeline grid colour: `TimelinePlugin.setGridLinesColor(color | null)`. Loop-seam notches (dark underlay + light tick) and the cut-line accent are theme-neutral by design and stay literal. Pin: `src/__tests__/clips-theme.test.ts`.
+
 ## Notes
 
 - See `AGENTS.md` in this dir for guidance targeting other AI agents (Codex, Gemini, etc.).
