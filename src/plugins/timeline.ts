@@ -214,12 +214,23 @@ class TimelinePlugin extends BasePlugin<TimelinePluginEvents, TimelinePluginOpti
   /**
    * Change the grid-line colour after creation and repaint the visible grid
    * (wavvy WVY-1777, light mode). `undefined` / `null` / an empty string
-   * restores the built-in default `'rgba(255, 255, 255, 0.12)'`. Bar / beat /
-   * sub-beat lines keep their relative alpha (1 / 0.4 / 0.18) on top of this
-   * colour. A repeat value is a no-op.
+   * restores the built-in default `'rgba(255, 255, 255, 0.12)'`, and so does
+   * a string the platform rejects as a colour (`CSS.supports`, when present)
+   * — canvas would silently ignore it, keep the old colour, then paint black
+   * after the next context reset. Bar / beat / sub-beat lines keep their
+   * relative alpha (1 / 0.4 / 0.18) on top of this colour. A repeat value is
+   * a no-op.
    */
   public setGridLinesColor(color: string | null | undefined) {
-    const next = typeof color === 'string' && color.trim() ? color : undefined
+    let next = typeof color === 'string' && color.trim() ? color.trim() : undefined
+    if (next !== undefined) {
+      try {
+        const css = (globalThis as any).CSS
+        if (css && typeof css.supports === 'function' && !css.supports('color', next)) next = undefined
+      } catch {
+        next = undefined
+      }
+    }
     if (this.options.gridLinesColor === next) return
     this.options.gridLinesColor = next
     if (!this.wavesurfer) return

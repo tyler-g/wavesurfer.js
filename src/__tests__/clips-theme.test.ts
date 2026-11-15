@@ -190,6 +190,31 @@ describe('canvas colours in the draw primitives (WVY-1777)', () => {
     expect(ctx.calls.find((c: Call) => c.op === 'fill').fillStyle).toBe('rgb(10, 20, 30)')
   })
 
+  it('tiled sample line + dots (loop clips at extreme zoom) use the sample colour', () => {
+    const { plugin, overlay } = connectedPlugin()
+    // Detached element → secPerCssPx = duration / clipWidthCss = 1 ms/px;
+    // 100 Hz source → 10 px/sample, past the 8 px dot threshold.
+    const clip = plugin.addClip({ id: 'c1', startTime: 0, duration: 1, sampleRate: 100 }) as any
+    const ch = new Float32Array(100).map((_, i) => Math.sin(i / 5) * 0.5)
+    const draw = () => {
+      const ctx = recordingCtx()
+      clip.drawChannelTiledSampleLine(ctx, ch, 1000, 50, 50, 0, 1000, 1000, 0, 1, 0)
+      const strokes = ctx.calls.filter((c: Call) => c.op === 'stroke').map((c: Call) => c.strokeStyle)
+      const dots = new Set(fills(ctx))
+      return { strokes, dots: [...dots], dotCount: fills(ctx).length }
+    }
+    let r = draw()
+    expect(r.strokes).toEqual(['rgba(255,255,255,0.85)'])
+    expect(r.dots).toEqual(['rgba(255,255,255,0.9)'])
+    expect(r.dotCount).toBeGreaterThan(0)
+
+    overlay.style.setProperty('--ws-clip-sample-color', '#0a141e')
+    plugin.invalidatePaint()
+    r = draw()
+    expect(r.strokes).toEqual(['#0a141e'])
+    expect(r.dots).toEqual(['#0a141e'])
+  })
+
   it('the colour lookup is cached until invalidatePaint', () => {
     const { plugin, overlay } = connectedPlugin()
     const spy = jest.spyOn(window, 'getComputedStyle')
@@ -206,6 +231,54 @@ describe('canvas colours in the draw primitives (WVY-1777)', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('theme colours at every use site (WVY-1777)', () => {
+  // Full-paint paths: each must paint its waveform with the old literal when
+  // no variable is set, and with --ws-clip-wave-color when it is.
+  const pcm = (n: number) => new Float32Array(n).fill(0.5)
+  const cases: [string, Record<string, any>, number][] = [
+    ['peaks-only (precomputed-peaks fallback)', { peaks: [0.1, 0.5, 0.3, 0.2] }, 1],
+    ['stereo PCM', { pcm: [pcm(4000), pcm(4000)], sampleRate: 4000 }, 2],
+    [
+      'loop-tiled PCM peaks',
+      { pcm: [pcm(4000)], sampleRate: 4000, loopEnabled: true, loopStartSec: 0, loopEndSec: 0.5 },
+      1,
+    ],
+  ]
+
+  it.each(cases)('%s paints with the old literal by default', (_name, params, nFills) => {
+    const { plugin } = connectedPlugin()
+    const clip = plugin.addClip({ id: 'c1', startTime: 0, duration: 1, ...params })
+    expect(fills((clip.canvas as any).getContext('2d'))).toEqual(Array(nFills).fill('rgba(255,255,255,0.4)'))
+  })
+
+  it.each(cases)('%s paints with --ws-clip-wave-color when set', (_name, params, nFills) => {
+    const { plugin, overlay } = connectedPlugin()
+    overlay.style.setProperty('--ws-clip-wave-color', 'rgb(1, 2, 3)')
+    const clip = plugin.addClip({ id: 'c1', startTime: 0, duration: 1, ...params })
+    expect(fills((clip.canvas as any).getContext('2d'))).toEqual(Array(nFills).fill('rgb(1, 2, 3)'))
+  })
+
+  it('each DOM site writes its own variable (handles, label colour)', () => {
+    // jsdom's CSSStyleDeclaration drops var() in color / border-*, so read
+    // the values at the setter instead of from the element.
+    const proto = (window as any).CSSStyleDeclaration.prototype
+    const seen: Record<string, string[]> = { borderLeft: [], borderRight: [], color: [] }
+    const spies = Object.keys(seen).map((prop) =>
+      jest.spyOn(proto, prop, 'set').mockImplementation(function (v: any) {
+        seen[prop].push(v)
+      }),
+    )
+    try {
+      ClipsPlugin.create().addClip({ id: 'c1', startTime: 0, duration: 1, name: 'Take' })
+    } finally {
+      spies.forEach((s) => s.mockRestore())
+    }
+    expect(seen.borderLeft).toEqual([CLIP_DOM_STYLE.handleBorder])
+    expect(seen.borderRight).toEqual([CLIP_DOM_STYLE.handleBorder])
+    expect(seen.color).toEqual([CLIP_DOM_STYLE.labelColor])
   })
 })
 
@@ -304,5 +377,21 @@ describe('TimelinePlugin.setGridLinesColor (WVY-1777)', () => {
     plugin.setGridLinesColor('#222')
     plugin.setGridLinesColor('  ')
     expect(lastFill(plugin)).toBe('rgba(255, 255, 255, 0.12)')
+  })
+
+  it('a string CSS rejects as a colour restores the default instead of leaking into fillStyle', () => {
+    const plugin = setup()
+    plugin.setGridLinesColor('#333')
+    expect(lastFill(plugin)).toBe('#333')
+    const prev = (globalThis as any).CSS
+    ;(globalThis as any).CSS = { supports: (_p: string, val: string) => val !== 'nonsense' }
+    try {
+      plugin.setGridLinesColor('nonsense')
+      expect(lastFill(plugin)).toBe('rgba(255, 255, 255, 0.12)')
+      plugin.setGridLinesColor('#444')
+      expect(lastFill(plugin)).toBe('#444')
+    } finally {
+      ;(globalThis as any).CSS = prev
+    }
   })
 })
