@@ -78,6 +78,10 @@ The clip label is a structured `div.ws-clip-label` row — optional hollow `span
 
 `addClip({ renderContent, contentWindowed: true })` routes a custom renderer through the same viewport-sized, timeline-device-pixel-grid-quantized canvas window as the PCM path and calls it with a 5th arg, `ClipContentWindow { startSec, endSec, pxPerSecDevice, bitmapW }` (`src/clip-render-math.ts`, `computeContentWindow`). 5-arg contract: map `x = (t − startSec) × pxPerSecDevice`, ignore `contentW`, and treat a NEGATIVE `startSec` as the left-edge-drag lead-in — real content (earlier loop tiles / earlier trim source) must be painted there, because `repaintForResizeDrag` slides the canvas into it (slide origin `paintCanvasLeftCss`). Windowed clips get a paint short-circuit keyed on window geometry + loop/drag inputs; `setData`/`setRenderContent` invalidate it. Flag off (default) = the legacy full-clip 4-arg path, unchanged. Wavvy consumer + details: `src/utils/midi-note-preview.ts`, `docs/architecture/clip-rendering.md` "Render path dispatch" §3.
 
+## ClipsPlugin free right edge (wavvy WVY-1136)
+
+`addClip({ freeRightEdge: true })` lifts ONLY the trim-mode right-edge clamp in `onResize` (`offset + duration <= dragStartExtent`), so the clip's right edge drags past its content (wavvy arrangement MIDI clips: room past the last note is silence, Ableton parity). Default off: every existing behaviour is identical. Left alone with the flag on: the `trimMode` predicate itself, the left-edge offset-0 stop, the seam-snap threshold, `chooseLeadInSec`, the left-drag window bound, host grid snap of the dragged end, the 0.01 s minimum width, and loop tiling (loop-mode and empty clips are not in trim mode, so the flag is inert for them). Construction-time only (no setter). Meant for `renderContent` clips: on a PCM clip a duration past `originalDuration` would draw through the resize-tile path. Pin: `src/__tests__/clips-free-right-edge.test.ts`; wavvy side: `docs/architecture/master-transport.md` "Trim-only resize".
+
 ## Notes
 
 - See `AGENTS.md` in this dir for guidance targeting other AI agents (Codex, Gemini, etc.).

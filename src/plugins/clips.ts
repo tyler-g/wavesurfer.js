@@ -140,6 +140,14 @@ export type ClipParams = {
    * `Function.length` is not a contract under obfuscation.
    */
   contentWindowed?: boolean
+  /**
+   * Right edge ignores the trim-mode source-extent clamp (wavvy WVY-1136:
+   * arrangement MIDI clips extend past their last note, Ableton parity).
+   * Default false. The left edge, snapping, the minimum width and loop
+   * tiling are unchanged. Meant for renderContent clips: on a PCM clip, a
+   * duration past originalDuration would draw through the resize-tile path.
+   */
+  freeRightEdge?: boolean
   /** Arbitrary data attached to the clip (e.g., MidiNote[] for MIDI clips) */
   data?: any
   /**
@@ -193,6 +201,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
   public renderContent: ClipRenderFn | undefined
   /** See `ClipParams.contentWindowed`. */
   public contentWindowed: boolean
+  /** See `ClipParams.freeRightEdge`. Construction-time only. */
+  public freeRightEdge: boolean
   public data: any
   public subscriptions: (() => void)[] = []
   private totalDuration: number
@@ -325,6 +335,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     this.selected = params.selected ?? false
     this.renderContent = params.renderContent
     this.contentWindowed = params.contentWindowed ?? false
+    this.freeRightEdge = params.freeRightEdge === true
     this.data = params.data
     this.pcm = params.pcm ?? null
     this.sampleRate = params.sampleRate ?? 44100
@@ -707,7 +718,8 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
     // A degenerate loop region (loopEndSec <= loopStartSec) must NOT count
     // as "loop tiling" — matches the engine's loopIsActive predicate
     // (arrangement-engine.ts) so the fork and engine agree on which clips
-    // are trim-mode.
+    // are trim-mode. `freeRightEdge` lifts only the right-edge bound
+    // (WVY-1136).
     const trimMode =
       !(this.loopEnabled && this.loopEndSec - this.loopStartSec > 0.0001) &&
       (this.originalDuration || 0) > 0.0001
@@ -800,7 +812,7 @@ class ClipBlockImpl extends EventEmitter<ClipBlockEvents> {
           Math.round((this.startTime + newDuration) / gridSec) * gridSec
         newDuration = snappedEnd - this.startTime
       }
-      if (trimMode) {
+      if (trimMode && !this.freeRightEdge) {
         const offset = (this.loopPhaseSec ?? 0) - this.resizeStartDeltaSec
         const maxDur = this.dragStartExtent - offset
         if (newDuration > maxDur) newDuration = maxDur
